@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::mpsc;
 use windows::Win32::Foundation::*;
@@ -6,52 +7,45 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 mod overlay;
 mod window;
 
-/// Custom window message posted from stdin worker to main window.
-const WM_OVERLAY_UPDATE: u32 = WM_APP + 0;
-
-/// Geometry update from the extension.
+/// Parsed geometry update from the extension (MEDIA_TARGETS_UPDATE).
 #[derive(Debug, Clone)]
-struct OverlayUpdate {
+struct TargetsUpdate {
     tab_id: i32,
-    screen_x: i32,
-    screen_y: i32,
-    width: i32,
-    height: i32,
+    _page_url: String,
+    viewport_screen_x: i32,
+    viewport_screen_y: i32,
     viewport_width: i32,
     viewport_height: i32,
-    page_url: String,
-    device_pixel_ratio: f64,
+    _device_pixel_ratio: f64,
+    targets: Vec<TargetPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetPayload {
+    element_id: String,
+    _client_x: i32,
+    _client_y: i32,
+    width: i32,
+    height: i32,
+    screen_x: i32,
+    screen_y: i32,
+    _media_url: String,
 }
 
 fn main() {
-    // Attempt to set per-monitor DPI awareness so coordinates are accurate.
+    // Per-monitor DPI awareness so coordinates are accurate.
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
     }
 
-    // Load turbrbtn.dll.
-    let api = match overlay::load_button_api() {
-        Some(api) => {
-            eprintln!("[tur] turbrbtn.dll loaded (v2 popup mode)");
-            api
-        }
-        None => {
-            eprintln!("[tur] FATAL: turbrbtn.dll not found or exports missing");
-            std::process::exit(1);
-        }
-    };
-
-    // Detect dark mode preference and propagate to the button DLL.
-    unsafe {
-        let is_dark = detect_dark_mode();
-        let _ = (api.set_dark_mode)(if is_dark { true.into() } else { false.into() });
-        eprintln!("[tur] dark mode: {}", is_dark);
-    }
+    // Initialise the canvas overlay system.
+    overlay::init();
+    eprintln!("[tur] single canvas overlay initialised");
 
     // Channel: stdin worker -> main thread.
-    let (tx, rx) = mpsc::channel::<OverlayUpdate>();
+    let (tx, rx) = mpsc::channel::<TargetsUpdate>();
 
     // Spawn stdin reader thread.
     let stdin_tx = tx.clone();
@@ -61,83 +55,56 @@ fn main() {
 
     // Create hidden controller window and enter message loop.
     unsafe {
-        run_message_pump(&api, rx);
+        run_message_pump(rx);
     }
 }
 
-/// Detect Windows dark mode preference from the registry.
-unsafe fn detect_dark_mode() -> bool {
-    // Simple registry check via reg.exe
-    let output = std::process::Command::new("reg")
-        .args(["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "/v", "AppsUseLightTheme"])
-        .output();
-    match output {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // Look for "0x0" in the output (meaning dark mode)
-            !s.contains("0x1")
-        }
-        Err(_) => false, // Default to light mode
-    }
-}
+// ── stdin reader (native messaging protocol) ─────────────────────────────
 
-/// Reads length-prefixed JSON messages from stdin (native messaging protocol).
-fn stdin_reader(tx: mpsc::Sender<OverlayUpdate>) {
+fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
     use std::io::Read;
 
     let mut stdin = std::io::stdin();
     let mut len_buf = [0u8; 4];
 
     loop {
-        // Read 4-byte little-endian length prefix.
         if let Err(e) = stdin.read_exact(&mut len_buf) {
             eprintln!("[tur] stdin read length error: {e}");
             break;
         }
         let msg_len = u32::from_le_bytes(len_buf) as usize;
 
-        // Read JSON message body.
         let mut msg_buf = vec![0u8; msg_len];
         if let Err(e) = stdin.read_exact(&mut msg_buf) {
             eprintln!("[tur] stdin read body error: {e}");
             break;
         }
 
-        // Parse JSON.
         let Ok(msg) = serde_json::from_slice::<serde_json::Value>(&msg_buf) else {
             eprintln!("[tur] invalid JSON from stdin");
             write_response(&serde_json::json!({"error": "invalid json"}));
             continue;
         };
 
-        // Route by message type.
         let msg_type = msg["type"].as_str().unwrap_or("");
         match msg_type {
-            "MEDIA_TARGET_UPDATE" => {
-                let tab_id = msg["tabId"].as_i64().unwrap_or(0) as i32;
-
-                let dpr = msg["devicePixelRatio"].as_f64().unwrap_or(1.0);
-
-                let update = OverlayUpdate {
-                    tab_id,
-                    screen_x: (msg["screenX"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    screen_y: (msg["screenY"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    width: (msg["width"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    height: (msg["height"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    viewport_width: (msg["viewportWidth"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    viewport_height: (msg["viewportHeight"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-                    page_url: msg["pageUrl"].as_str().unwrap_or("").to_string(),
-                    device_pixel_ratio: dpr,
-                };
-
-                if tx.send(update).is_err() {
-                    eprintln!("[tur] main thread dropped, exiting stdin reader");
-                    break;
+            "MEDIA_TARGETS_UPDATE" => {
+                let result = parse_targets_update(&msg);
+                match result {
+                    Ok(update) => {
+                        if tx.send(update).is_err() {
+                            eprintln!("[tur] main thread dropped, exiting");
+                            break;
+                        }
+                        write_response(&serde_json::json!({"ok": true}));
+                    }
+                    Err(e) => {
+                        eprintln!("[tur] parse error: {e}");
+                        write_response(&serde_json::json!({"error": format!("parse: {e}")}));
+                    }
                 }
-                write_response(&serde_json::json!({"ok": true}));
             }
-            "MEDIA_CANDIDATES" | "MEDIA_DETECTED_NETWORK" => {
-                // Silently acknowledge; no overlay action needed.
+            "MEDIA_TARGET_UPDATE" | "MEDIA_CANDIDATES" | "MEDIA_DETECTED_NETWORK" => {
                 write_response(&serde_json::json!({"ok": true}));
             }
             other => {
@@ -147,18 +114,57 @@ fn stdin_reader(tx: mpsc::Sender<OverlayUpdate>) {
         }
     }
 
-    // Signal main thread to quit via WM_QUIT on controller.
+    // Signal main thread to quit.
     let hwnd = CONTROLLER_HWND.load(std::sync::atomic::Ordering::Acquire);
     if hwnd != 0 {
         unsafe {
             let _ = PostMessageW(
-                HWND(hwnd as *mut std::ffi::c_void),
+                HWND(hwnd as *mut c_void),
                 WM_QUIT,
                 WPARAM(0),
                 LPARAM(0),
             );
         }
     }
+}
+
+fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String> {
+    let dpr = msg["devicePixelRatio"].as_f64().unwrap_or(1.0);
+    let raw_targets = msg["targets"].as_array().ok_or("missing targets array")?;
+    let mut targets = Vec::with_capacity(raw_targets.len());
+
+    for t in raw_targets {
+        let element_id = t["elementId"].as_str().unwrap_or("_unknown_").to_string();
+        let _client_x = (t["clientX"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let _client_y = (t["clientY"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let width = (t["width"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let height = (t["height"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let screen_x = (t["screenX"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let screen_y = (t["screenY"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let _media_url = t["mediaUrl"].as_str().unwrap_or("").to_string();
+
+        targets.push(TargetPayload {
+            element_id,
+            _client_x,
+            _client_y,
+            width,
+            height,
+            screen_x,
+            screen_y,
+            _media_url,
+        });
+    }
+
+    Ok(TargetsUpdate {
+        tab_id: msg["tabId"].as_i64().unwrap_or(0) as i32,
+        _page_url: msg["pageUrl"].as_str().unwrap_or("").to_string(),
+        viewport_screen_x: (msg["viewportScreenX"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
+        viewport_screen_y: (msg["viewportScreenY"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
+        viewport_width: (msg["viewportWidth"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
+        viewport_height: (msg["viewportHeight"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
+        _device_pixel_ratio: dpr,
+        targets,
+    })
 }
 
 fn write_response(value: &serde_json::Value) {
@@ -173,12 +179,13 @@ fn write_response(value: &serde_json::Value) {
 
 static CONTROLLER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-unsafe fn run_message_pump(api: &overlay::ButtonApi, rx: mpsc::Receiver<OverlayUpdate>) {
-    // Register a hidden controller window class.
-    let instance: HINSTANCE = HINSTANCE(
+// ── main thread: controller window + message pump ────────────────────────
+
+unsafe fn run_message_pump(rx: mpsc::Receiver<TargetsUpdate>) {
+    let instance = HINSTANCE(
         windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-            .unwrap_or_default()
-            .0,
+            .map(|m| m.0)
+            .unwrap_or_default(),
     );
 
     let class_name = windows::core::w!("TurOverlayController");
@@ -192,7 +199,6 @@ unsafe fn run_message_pump(api: &overlay::ButtonApi, rx: mpsc::Receiver<OverlayU
     };
     let _ = RegisterClassW(&wc);
 
-    // Create the hidden controller window.
     let controller = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class_name,
@@ -211,24 +217,19 @@ unsafe fn run_message_pump(api: &overlay::ButtonApi, rx: mpsc::Receiver<OverlayU
     }
     let controller = controller.unwrap();
 
-    // Store controller HWND for stdin reader to wake us up.
     CONTROLLER_HWND.store(controller.0 as isize, std::sync::atomic::Ordering::Release);
 
-    // Store the channel receiver in user data so wndproc can access.
     let rx_box = Box::new(rx);
     let rx_ptr = Box::into_raw(rx_box);
     SetWindowLongPtrW(controller, GWLP_USERDATA, rx_ptr as isize);
 
-    // Enter the message loop.
     let mut msg = MSG::default();
     loop {
-        // Drain pending updates from the stdin thread.
-        let rx_ref = &*(rx_ptr as *const mpsc::Receiver<OverlayUpdate>);
+        let rx_ref = &*(rx_ptr as *const mpsc::Receiver<TargetsUpdate>);
         while let Ok(update) = rx_ref.try_recv() {
-            handle_geometry_update(api, &update, controller);
+            handle_targets_update(&update, controller);
         }
 
-        // Process Windows messages (non-blocking).
         let has_msg = PeekMessageW(&mut msg, HWND(null_mut()), 0, 0, PM_REMOVE).as_bool();
         if has_msg {
             if msg.message == WM_QUIT {
@@ -237,16 +238,12 @@ unsafe fn run_message_pump(api: &overlay::ButtonApi, rx: mpsc::Receiver<OverlayU
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         } else {
-            // Sleep briefly to avoid busy-waiting.
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 
-    // Cleanup all buttons.
-    overlay::destroy_all_buttons(api);
+    overlay::destroy();
     let _ = DestroyWindow(controller);
-
-    // Free the boxed receiver.
     let _ = Box::from_raw(rx_ptr);
 }
 
@@ -266,42 +263,86 @@ unsafe extern "system" fn controller_wndproc(
     }
 }
 
-unsafe fn handle_geometry_update(api: &overlay::ButtonApi, update: &OverlayUpdate, _controller: HWND) {
-    if update.width <= 0 || update.height <= 0
-        || update.viewport_width <= 0 || update.viewport_height <= 0
+// ── overlay update logic ─────────────────────────────────────────────────
+
+unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
+    let is_dark = detect_dark_mode();
+
+    if update.targets.is_empty()
+        || update.viewport_width <= 0
+        || update.viewport_height <= 0
     {
-        overlay::hide_button(api, update.tab_id);
+        overlay::hide();
         return;
     }
 
-    // Find the center of the media element in screen space.
-    let target_center_x = update.screen_x + (update.width / 2);
-    let target_center_y = update.screen_y + (update.height / 2);
+    // Find the Chrome window that owns this viewport.
+    let center_x = update.viewport_screen_x + update.viewport_width / 2;
+    let center_y = update.viewport_screen_y + update.viewport_height / 2;
 
-    // Find the Chrome root window that contains this point.
-    let Some(root) = window::find_chromium_root_for_point(target_center_x, target_center_y) else {
-        eprintln!(
-            "[tur] no chromium root for tab={} point=({}, {})",
-            update.tab_id, target_center_x, target_center_y
-        );
-        overlay::hide_button(api, update.tab_id);
-        return;
-    };
-
-    // Find the actual web content rendering surface (Chrome_RenderWidgetHostHWND).
-    let content_surface = window::find_chromium_content_surface(root);
+    // Use the TOP-LEVEL Chrome_WidgetWin_1 as owner, NOT the child
+    // Chrome_RenderWidgetHostHWND. The DWM aggressively clips popups
+    // owned by deep child windows.
+    let root = window::find_chromium_root_for_point(center_x, center_y);
+    let owner = root.unwrap_or(HWND(null_mut()));
 
     eprintln!(
-        "[tur] tab={} root={:?} content_surface={:?} pos=({}, {}) size=({}x{})",
+        "[tur] tab={} targets={} viewport=({},{} {}x{}) root={:?} dpr={}",
         update.tab_id,
+        update.targets.len(),
+        update.viewport_screen_x,
+        update.viewport_screen_y,
+        update.viewport_width,
+        update.viewport_height,
         root,
-        content_surface,
-        update.screen_x,
-        update.screen_y,
-        update.width,
-        update.height
+        update._device_pixel_ratio,
     );
 
-    // Update the popup overlay button at absolute screen coordinates.
-    overlay::update_button(api, update, root, content_surface);
+    let overlay_targets: Vec<overlay::TargetInfo> = update
+        .targets
+        .iter()
+        .map(|t| overlay::TargetInfo {
+            element_id: t.element_id.clone(),
+            screen_x: t.screen_x,
+            screen_y: t.screen_y,
+            width: t.width,
+            _height: t.height,
+        })
+        .collect();
+
+    overlay::update(overlay::CanvasUpdate {
+        tab_id: update.tab_id,
+        viewport_screen_x: update.viewport_screen_x,
+        viewport_screen_y: update.viewport_screen_y,
+        viewport_width: update.viewport_width,
+        viewport_height: update.viewport_height,
+        device_pixel_ratio: update._device_pixel_ratio,
+        targets: overlay_targets,
+        owner: owner.0 as isize,
+        is_dark,
+    });
+}
+
+// ── dark mode detection (cached once) ────────────────────────────────────
+
+static DARK_MODE_INIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn detect_dark_mode() -> bool {
+    *DARK_MODE_INIT.get_or_init(|| {
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "/v",
+                "AppsUseLightTheme",
+            ])
+            .output();
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                !s.contains("0x1")
+            }
+            Err(_) => false,
+        }
+    })
 }

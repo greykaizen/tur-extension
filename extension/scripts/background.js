@@ -164,7 +164,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === "MEDIA_TARGET_UPDATE" && Number.isInteger(tabId)) {
+  if (message.type === "MEDIA_TARGETS_UPDATE" && Number.isInteger(tabId)) {
+    handleTargetsUpdate(tabId, sender.tab, message.payload || {})
+      .then((result) => sendResponse?.({ ok: true, result }))
+      .catch((error) => {
+        console.warn("[Background] Failed to handle targets update.", error);
+        sendResponse?.({ ok: false, error: String(error) });
+      });
+    return true;
+  }
+
+    if (message.type === "MEDIA_TARGET_UPDATE" && Number.isInteger(tabId)) {
     handleTargetUpdate(tabId, sender.tab, message.payload || {})
       .then((mappedPayload) => sendResponse?.({ ok: true, mappedPayload }))
       .catch((error) => {
@@ -343,6 +353,10 @@ async function handleTargetUpdate(tabId, tab, targetPayload) {
     debugChromeRatio: Number(ratio.toFixed(4)),
   });
 
+  console.log("[tur] handleTargetsUpdate tab=" + tabId + " targets=" + (payload.targets || []).length + " vp=(" + payload.viewport_screen_x + "," + payload.viewport_screen_y + " " + payload.viewport_width + "x" + payload.viewport_height + ")");
+  (payload.targets || []).forEach(function(t, i) {
+    console.log("[tur]   [" + i + "] id=" + (t.element_id || "?") + " sx=" + t.screen_x + " sy=" + t.screen_y + " w=" + t.width + " h=" + t.height);
+  });
   tabTargets.set(tabId, payload);
   rememberTabMediaBatch(tabId, payload.media || []);
   persistTabTarget(tabId, payload);
@@ -353,6 +367,131 @@ async function handleTargetUpdate(tabId, tab, targetPayload) {
     hideOverlayForTab(tabId, payload);
   }
   return payload;
+}
+
+async function handleTargetsUpdate(tabId, tab, payload) {
+  if (payload && payload.isTopFrame === false) {
+    rememberTabMediaBatch(tabId, payload.media || []);
+    return { isSubFrame: true };
+  }
+
+  // ── Correct viewport screen position using chrome.windows.get() ──
+  const viewportWidth = Number(payload.viewportWidth || 0);
+  const viewportHeight = Number(payload.viewportHeight || 0);
+  let viewportScreenX = Number(payload.viewportScreenX || 0);
+  let viewportScreenY = Number(payload.viewportScreenY || 0);
+
+  let browserWindowLeft = 0;
+  let browserWindowTop = 0;
+  let browserWindowWidth = 0;
+  let browserWindowHeight = 0;
+  if (tab && tab.windowId) {
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      browserWindowLeft = Number(win.left || 0);
+      browserWindowTop = Number(win.top || 0);
+      browserWindowWidth = Number(win.width || 0);
+      browserWindowHeight = Number(win.height || 0);
+    } catch (_) {}
+  }
+
+  let zoomFactor = 1.0;
+  try {
+    zoomFactor = await chrome.tabs.getZoom(tabId);
+  } catch (_) {}
+
+  // Calculate chrome chrome delta in DIPs (OS units)
+  let deltaX = 0;
+  let deltaY = 0;
+  if (browserWindowWidth > 0) {
+    deltaX = Math.max(0, browserWindowWidth - (viewportWidth * zoomFactor));
+    deltaY = Math.max(0, browserWindowHeight - (viewportHeight * zoomFactor));
+  } else {
+    const outerWidth = Number(payload.outerWidth || 0);
+    const outerHeight = Number(payload.outerHeight || 0);
+    deltaX = Math.max(0, outerWidth - viewportWidth);
+    deltaY = Math.max(0, outerHeight - viewportHeight);
+  }
+
+  let classifiedMode = "unknown";
+  if (viewportWidth > 0 && viewportHeight > 0) {
+    classifiedMode = deltaX <= 40 ? "likely-top-tabs" : "likely-vertical-tabs";
+  }
+
+  if (browserWindowWidth > 0) {
+    if (classifiedMode === "likely-vertical-tabs") {
+      const L_chrome = Math.max(0, deltaX - 8);
+      const T_chrome = Math.max(0, deltaY - 8);
+      viewportScreenX = Math.round(browserWindowLeft + L_chrome);
+      viewportScreenY = Math.round(browserWindowTop + T_chrome);
+    } else {
+      const fallbackBorderX = Math.max(0, Math.round(deltaX / 2));
+      const fallbackChromeTop = Math.max(0, Math.round(deltaY - fallbackBorderX));
+      viewportScreenX = Math.round(browserWindowLeft + fallbackBorderX);
+      viewportScreenY = Math.round(browserWindowTop + fallbackChromeTop);
+    }
+  }
+
+  // ── Build targets with corrected screen coordinates ──
+  var targets = (payload.targets || []).map(function(t) {
+    var sx = Math.round(viewportScreenX + Number(t.clientX || 0) - Number(t.width || 0));
+    var sy = Math.round(viewportScreenY + Number(t.clientY || 0));
+    var w = Math.round(Number(t.width || 0));
+    var h = Math.round(Number(t.height || 0));
+    return {
+      elementId: t.elementId || "_unknown_",
+      clientX: Math.round(Number(t.clientX || 0)),
+      clientY: Math.round(Number(t.clientY || 0)),
+      width: w,
+      height: h,
+      screenX: sx,
+      screenY: sy,
+      mediaUrl: t.mediaUrl || "",
+    };
+  });
+
+  console.log("[Background] handleTargetsUpdate — corrected viewport", {
+    tabId,
+    pageUrl: payload.pageUrl || (tab && tab.url),
+    debugLayoutMode: classifiedMode,
+    viewportBefore: Number(payload.viewportScreenX || 0) + "," + Number(payload.viewportScreenY || 0),
+    viewportAfter: viewportScreenX + "," + viewportScreenY,
+    browserWindowLeft,
+    browserWindowTop,
+    browserWindowWidth,
+    browserWindowHeight,
+    viewportWidth,
+    viewportHeight,
+    deltaX,
+    deltaY,
+    targetCount: targets.length,
+  });
+
+  // ── Build outgoing message ──
+  var outgoing = {
+    type: "MEDIA_TARGETS_UPDATE",
+    pageUrl: payload.pageUrl || (tab && tab.url) || "",
+    pageTitle: payload.pageTitle || (tab && tab.title) || "",
+    referer: payload.referer || payload.pageUrl || (tab && tab.url) || "",
+    media: payload.media || [],
+    viewportScreenX: viewportScreenX,
+    viewportScreenY: viewportScreenY,
+    viewportWidth: viewportWidth,
+    viewportHeight: viewportHeight,
+    devicePixelRatio: payload.devicePixelRatio || 1.0,
+    targets: targets,
+    tabId: tabId,
+  };
+
+  tabTargets.set(tabId, outgoing);
+  rememberTabMediaBatch(tabId, payload.media || []);
+
+  if (shouldDisplayOverlayForTab(tab)) {
+    sendToHost(outgoing);
+  } else {
+    hideOverlayForTab(tabId, outgoing);
+  }
+  return outgoing;
 }
 
 async function initializeOverlayVisibilityState() {
@@ -373,7 +512,9 @@ function shouldDisplayOverlayForTab(tab) {
 
 function buildHiddenPayload(tabId, prior = {}) {
   return {
-    type: "MEDIA_TARGET_UPDATE",
+    type: "MEDIA_TARGETS_UPDATE",
+    targets: prior.targets || [],
+    
     pageUrl: prior.pageUrl || "",
     pageTitle: prior.pageTitle || "",
     referer: prior.referer || "",

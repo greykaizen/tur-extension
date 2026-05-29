@@ -13,6 +13,7 @@ let extensionAlive = true;
 let rafId = 0;
 let lastTargetSignature = "";
 let lastCandidatesSignature = "";
+let elementIdCounter = 0;
 
 const intersectionObserver = new IntersectionObserver(scheduleTargetReport, {
   threshold: [0, 0.2, 0.5, 0.9],
@@ -74,6 +75,14 @@ setInterval(() => {
 }, 1200);
 
 scheduleTargetReport();
+
+function ensureElementId(element) {
+  if (element.dataset.turId) return element.dataset.turId;
+  elementIdCounter++;
+  const id = "tur_target_" + elementIdCounter;
+  element.dataset.turId = id;
+  return id;
+}
 
 function rememberMedia(url, mediaType = "direct", pageUrl = window.location.href, category = "unknown", source = "unknown") {
   if (!url || typeof url !== "string") return;
@@ -162,71 +171,17 @@ function scheduleTargetReport() {
   if (!extensionAlive || rafId) return;
   rafId = requestAnimationFrame(() => {
     rafId = 0;
-    reportTarget();
+    reportTargets();
   });
 }
 
-function reportTarget() {
-  const target = pickBestTarget();
-  const payload = target ? buildTargetPayload(target) : buildPagePayload();
-  const signature = JSON.stringify({
-    pageUrl: payload.pageUrl,
-    x: payload.screenX,
-    y: payload.screenY,
-    width: payload.width,
-    height: payload.height,
-    mediaCount: payload.media.length,
-    firstUrl: payload.media[0]?.url || "",
-  });
-
-  if (signature === lastTargetSignature) return;
-  lastTargetSignature = signature;
-  renderDebugOverlay(payload);
-
-
-  safeSendMessage({
-    type: "MEDIA_TARGET_UPDATE",
-    payload,
-  });
-}
-
-function buildTargetPayload(target) {
-  const { element, rect, metadata } = target;
+function reportTargets() {
+  const targets = collectAllTargets();
+  const media = sortedCandidates();
   const viewport = currentViewportGeometry();
-  const media = sortedCandidates().map((item) => ({
-    ...metadata,
-    ...item,
-    label: item.label || candidateLabel(item, metadata),
-  }));
 
-  const elementUrl = element.localName === "iframe"
-    ? (element.src || element.getAttribute("data-src") || "")
-    : (element.currentSrc || element.src || element.data || "");
-
-  if (elementUrl && !elementUrl.startsWith("blob:") && !media.some((item) => item.url === elementUrl)) {
-    const classified = window.TurDownloadClassifier?.classifyDownload(elementUrl) || {};
-    media.unshift({
-      url: elementUrl,
-      mediaType: classified.mediaType || guessMediaTypeForElement(element),
-      category: classified.category || guessCategoryForElement(element),
-      pageUrl: window.location.href,
-      playable: classified.playable || true,
-      source: "active-element",
-      ...metadata,
-      label: candidateLabel({
-        url: elementUrl,
-        mediaType: classified.mediaType || guessMediaTypeForElement(element),
-        category: classified.category || guessCategoryForElement(element),
-      }, metadata),
-    });
-  }
-
-  if (media.length === 0) {
-    media.push(pageCandidate(metadata));
-  }
-
-  return {
-    type: "MEDIA_TARGET_UPDATE",
+  const payload = {
+    type: "MEDIA_TARGETS_UPDATE",
     pageUrl: window.location.href,
     pageTitle: document.title,
     referer: window.location.href,
@@ -241,51 +196,70 @@ function buildTargetPayload(target) {
     rawWindowScreenY: Math.round(window.screenY),
     outerWidth: Math.round(window.outerWidth),
     outerHeight: Math.round(window.outerHeight),
-    clientX: Math.round(rect.right),
-    clientY: Math.round(rect.top),
-    screenX: Math.round(viewport.screenX + rect.left),
-    screenY: Math.round(viewport.screenY + rect.top),
-    width: Math.round(rect.width),
-    height: Math.round(rect.height),
-    videoWidth: metadata.width,
-    videoHeight: metadata.height,
-    duration: metadata.duration,
-    frameUrl: window.location.href,
     devicePixelRatio: window.devicePixelRatio,
+    targets,
   };
+
+  const signature = JSON.stringify({
+    targetCount: targets.length,
+    targets: targets.map(function(t) {
+      return t.elementId + ":" + t.clientX + ":" + t.clientY + ":" + t.width + ":" + t.height;
+    }).join("|"),
+    mediaCount: media.length,
+    vp: viewport.screenX + "," + viewport.screenY + "," + viewport.width + "," + viewport.height,
+  });
+
+  if (signature === lastTargetSignature) return;
+  lastTargetSignature = signature;
+  renderDebugOverlay(payload);
+
+  safeSendMessage({
+    type: "MEDIA_TARGETS_UPDATE",
+    payload,
+  });
 }
 
-function buildPagePayload() {
-  const viewport = currentViewportGeometry();
-  const media = sortedCandidates();
-  return {
-    type: "MEDIA_TARGET_UPDATE",
-    pageUrl: window.location.href,
-    pageTitle: document.title,
-    referer: window.location.href,
-    userAgent: navigator.userAgent,
-    media: media.length > 0 ? media : [pageCandidate({ width: 0, height: 0, duration: null })],
-    isTopFrame: window === window.top,
-    viewportScreenX: viewport.screenX,
-    viewportScreenY: viewport.screenY,
-    viewportWidth: viewport.width,
-    viewportHeight: viewport.height,
-    rawWindowScreenX: Math.round(window.screenX),
-    rawWindowScreenY: Math.round(window.screenY),
-    outerWidth: Math.round(window.outerWidth),
-    outerHeight: Math.round(window.outerHeight),
-    clientX: 0,
-    clientY: 0,
-    screenX: 0,
-    screenY: 0,
-    width: 0,
-    height: 0,
-    videoWidth: 0,
-    videoHeight: 0,
-    duration: null,
-    frameUrl: window.location.href,
-    devicePixelRatio: window.devicePixelRatio,
-  };
+function collectAllTargets() {
+  const elements = findMediaElements();
+  const results = [];
+
+  for (const element of elements) {
+    if (!element.isConnected) continue;
+
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      continue;
+    }
+
+    const rect = computeClippedRect(element);
+    if (!rect) continue;
+
+    const tag = element.localName;
+    if (tag === "iframe" && !isLikelyVideoIframe(element)) continue;
+
+    const minimumWidth = tag === "audio" ? 1 : 96;
+    const minimumHeight = tag === "audio" ? 1 : 54;
+    if (rect.width < minimumWidth || rect.height < minimumHeight) continue;
+
+    const elementId = ensureElementId(element);
+    const elementUrl = tag === "iframe"
+      ? (element.src || element.getAttribute("data-src") || "")
+      : (element.currentSrc || element.src || element.data || "");
+
+    // Only include elements that have a detectable media source or are iframes
+    if (!elementUrl && tag !== "iframe") continue;
+
+    results.push({
+      elementId,
+      clientX: Math.round(rect.right),
+      clientY: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      mediaUrl: elementUrl,
+    });
+  }
+
+  return results;
 }
 
 function currentViewportGeometry() {
@@ -346,88 +320,6 @@ function isLikelyVideoIframe(iframe) {
   }
 }
 
-function pickBestTarget() {
-  let best = null;
-  let bestScore = Number.NEGATIVE_INFINITY;
-  const elements = findMediaElements();
-
-  for (const element of elements) {
-    const target = describeTarget(element);
-    if (!target) continue;
-
-    const { rect, metadata, visibleRatio, occluded } = target;
-    const area = rect.width * rect.height;
-    const aspect = rect.height > 0 ? rect.width / rect.height : 0;
-    
-    let tagBonus = 1.0;
-    if (element.localName === "video") {
-      tagBonus = 3.0;
-    } else if (element.localName === "iframe") {
-      tagBonus = 1.8;
-    } else if (element.localName === "audio") {
-      tagBonus = 0.9;
-    } else {
-      tagBonus = 1.25;
-    }
-
-    const playingBonus = element instanceof HTMLMediaElement && !element.paused ? 1.8 : 1.0;
-    const sourceBonus = (element.currentSrc || element.src || element.getAttribute("data-src") || element.getAttribute("data")) ? 1.15 : 1.0;
-    const resolutionBonus = metadata.width >= 640 || metadata.height >= 360 ? 1.12 : 1.0;
-    const aspectPenalty = aspect > 0 && (aspect < 0.2 || aspect > 6) ? 0.25 : 1.0;
-    const occlusionPenalty = occluded ? 0.35 : 1.0;
-    
-    const score =
-      area *
-      visibleRatio *
-      tagBonus *
-      playingBonus *
-      sourceBonus *
-      resolutionBonus *
-      aspectPenalty *
-      occlusionPenalty;
-
-    if (score > bestScore) {
-      best = target;
-      bestScore = score;
-    }
-  }
-  return best;
-}
-
-function describeTarget(element) {
-  if (!element.isConnected) return null;
-
-  const style = window.getComputedStyle(element);
-  if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
-    return null;
-  }
-
-  const rect = computeClippedRect(element);
-  if (!rect) return null;
-
-  const tag = element.localName;
-  if (tag === "iframe") {
-    if (!isLikelyVideoIframe(element)) return null;
-  }
-
-  const minimumWidth = tag === "audio" ? 1 : 96;
-  const minimumHeight = tag === "audio" ? 1 : 54;
-  if (rect.width < minimumWidth || rect.height < minimumHeight) return null;
-
-  const rawRect = element.getBoundingClientRect();
-  const rawArea = Math.max(1, rawRect.width * rawRect.height);
-  const visibleRatio = Math.min(1, (rect.width * rect.height) / rawArea);
-  const occluded = isLikelyOccluded(element, rect);
-
-  return {
-    element,
-    rect,
-    metadata: mediaMetadata(element),
-    visibleRatio,
-    occluded,
-  };
-}
-
 function computeClippedRect(element) {
   let rect = toMutableRect(element.getBoundingClientRect());
   if (rect.width <= 0 || rect.height <= 0) return null;
@@ -440,11 +332,6 @@ function computeClippedRect(element) {
   });
 
   return rect;
-}
-
-function clipsOverflow(style) {
-  const values = [style.overflow, style.overflowX, style.overflowY];
-  return values.some((value) => ["hidden", "clip", "scroll", "auto"].includes(value));
 }
 
 function intersectRects(a, b) {
@@ -464,7 +351,6 @@ function intersectRects(a, b) {
     height: bottom - top,
   };
 }
-
 function toMutableRect(rect) {
   return {
     left: rect.left,
@@ -474,33 +360,6 @@ function toMutableRect(rect) {
     width: rect.width,
     height: rect.height,
   };
-}
-
-function isLikelyOccluded(element, rect) {
-  return false;
-}
-
-function isCoveredAtPoint(element, x, y) {
-  const stack = document.elementsFromPoint(x, y);
-  for (const node of stack) {
-    if (node === element || element.contains(node) || node.contains(element)) return false;
-    const style = window.getComputedStyle(node);
-    if (style.visibility !== "visible" || style.display === "none" || Number(style.opacity) === 0) {
-      continue;
-    }
-    if (style.pointerEvents === "none") continue;
-    if (hasVisiblePaint(style)) return true;
-  }
-  return false;
-}
-
-function hasVisiblePaint(style) {
-  return style.backgroundColor !== "rgba(0, 0, 0, 0)" ||
-    style.backgroundImage !== "none" ||
-    style.borderTopWidth !== "0px" ||
-    style.borderRightWidth !== "0px" ||
-    style.borderBottomWidth !== "0px" ||
-    style.borderLeftWidth !== "0px";
 }
 
 function sortedCandidates() {
@@ -519,71 +378,6 @@ function candidateRank(item) {
   return 5;
 }
 
-function pageCandidate(metadata) {
-  return {
-    url: window.location.href,
-    mediaType: "page",
-    category: "page",
-    pageUrl: window.location.href,
-    playable: true,
-    source: "page-fallback",
-    ...metadata,
-    label: candidateLabel({ mediaType: "page", category: "page", url: window.location.href }, metadata),
-  };
-}
-
-function mediaMetadata(element) {
-  if (element instanceof HTMLVideoElement) {
-    return {
-      width: Math.round(element.videoWidth || element.getBoundingClientRect().width || 0),
-      height: Math.round(element.videoHeight || element.getBoundingClientRect().height || 0),
-      duration: Number.isFinite(element.duration) ? element.duration : null,
-    };
-  }
-
-  if (element instanceof HTMLAudioElement) {
-    return {
-      width: 0,
-      height: 0,
-      duration: Number.isFinite(element.duration) ? element.duration : null,
-    };
-  }
-
-  const rect = element.getBoundingClientRect();
-  return {
-    width: Math.round(rect.width || 0),
-    height: Math.round(rect.height || 0),
-    duration: null,
-  };
-}
-
-function candidateLabel(item, metadata) {
-  const details = [];
-  if (metadata.width && metadata.height) details.push(`${metadata.width}x${metadata.height}`);
-  if (metadata.duration) details.push(formatDuration(metadata.duration));
-  details.push(labelKind(item.mediaType || item.category));
-  return `Download ${details.join(" | ")}`;
-}
-
-function labelKind(kind) {
-  if (kind === "hls") return "HLS";
-  if (kind === "dash") return "DASH";
-  if (kind === "audio") return "Audio";
-  if (kind === "page") return "yt-dlp";
-  if (kind === "direct") return "Direct";
-  return "Video";
-}
-
-function formatDuration(seconds) {
-  const total = Math.max(0, Math.round(seconds));
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
-    : `${minutes}:${String(secs).padStart(2, "0")}`;
-}
-
 function guessMediaTypeForElement(element) {
   if (element.localName === "audio") return "audio";
   if (element.localName === "video") return "video";
@@ -595,10 +389,8 @@ function guessCategoryForElement(element) {
   if (element.localName === "video") return "video";
   return "download";
 }
-
-
 // ── Debug overlay boxes ──────────────────────────────────────────────
-// Red = target element, Blue = viewport, Yellow = button anchor position
+// Blue = viewport, Red = target elements, Yellow = button anchors
 const DEBUG_OVERLAY = false;
 
 function renderDebugOverlay(payload) {
@@ -609,42 +401,48 @@ function renderDebugOverlay(payload) {
 
   const vw = Math.max(0, Number(payload.viewportWidth || 0));
   const vh = Math.max(0, Number(payload.viewportHeight || 0));
-  const tw = Math.max(0, Number(payload.width || 0));
-  const th = Math.max(0, Number(payload.height || 0));
-  const tx = Math.max(0, Number(payload.clientX || 0) - tw);
-  const ty = Math.max(0, Number(payload.clientY || 0));
-
   if (vw <= 0 || vh <= 0) return;
 
+  // Viewport box
   root.appendChild(makeDebugBox({
     left: 0, top: 0, width: vw, height: vh,
     border: "2px solid rgba(0, 120, 255, 0.5)",
     background: "rgba(0, 120, 255, 0.08)",
   }));
 
-  if (tw <= 0 || th <= 0) return;
+  // Target boxes for each element
+  var targets = payload.targets || [];
+  for (var i = 0; i < targets.length; i++) {
+    var t = targets[i];
+    var tw = Math.max(0, Number(t.width || 0));
+    var th = Math.max(0, Number(t.height || 0));
+    if (tw <= 0 || th <= 0) continue;
 
-  root.appendChild(makeDebugBox({
-    left: tx, top: ty, width: tw, height: th,
-    border: "2px solid rgba(255, 50, 50, 0.7)",
-    background: "rgba(255, 50, 50, 0.10)",
-  }));
+    var tx = Math.max(0, Number(t.clientX || 0) - tw);
+    var ty = Math.max(0, Number(t.clientY || 0));
 
-  let ax = tx + tw - 226;
-  const ay = ty - 26 - 2;
-  ax = Math.max(0, Math.min(ax, Math.max(0, vw - 226)));
-
-  if (ay >= 0) {
     root.appendChild(makeDebugBox({
-      left: ax, top: ay, width: 226, height: 26,
-      border: "2px solid rgba(255, 200, 0, 0.8)",
-      background: "rgba(255, 200, 0, 0.15)",
+      left: tx, top: ty, width: tw, height: th,
+      border: "2px solid rgba(255, 50, 50, 0.7)",
+      background: "rgba(255, 50, 50, 0.10)",
     }));
 
-    const label = document.createElement("div");
-    label.textContent = "\u25E1 ANCHOR";
-    label.style.cssText = "position:absolute;left:" + Math.round(ax) + "px;top:" + Math.round(ay - 14) + "px;font:700 10px/1 ui-sans-serif,sans-serif;color:rgba(255,200,0,0.9);pointer-events:none;user-select:none;white-space:nowrap;z-index:2147483647;";
-    root.appendChild(label);
+    // Button anchor
+    var ax = Math.max(0, Math.min(tx + tw - 226, Math.max(0, vw - 226)));
+    var ay = ty - 26 - 2;
+
+    if (ay >= 0) {
+      root.appendChild(makeDebugBox({
+        left: ax, top: ay, width: 226, height: 26,
+        border: "2px solid rgba(255, 200, 0, 0.8)",
+        background: "rgba(255, 200, 0, 0.15)",
+      }));
+
+      var label = document.createElement("div");
+      label.textContent = "\u25E1 " + (t.elementId || "?") + " (" + Math.round(ax) + ", " + Math.round(ay) + ")";
+      label.style.cssText = "position:absolute;left:" + Math.round(ax) + "px;top:" + Math.round(ay - 14) + "px;font:700 10px/1 ui-sans-serif,sans-serif;color:rgba(255,200,0,0.9);pointer-events:none;user-select:none;white-space:nowrap;z-index:2147483647;";
+      root.appendChild(label);
+    }
   }
 }
 
