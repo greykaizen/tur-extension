@@ -299,6 +299,7 @@ async function handleTargetUpdate(tabId, tab, targetPayload) {
     duration: Number(targetPayload.duration || 0),
     frameUrl: targetPayload.frameUrl || targetPayload.pageUrl || tab?.url || "",
     tabId,
+    devicePixelRatio: targetPayload.devicePixelRatio || 1.0,
     rawWindowScreenX,
     rawWindowScreenY,
     outerWidth,

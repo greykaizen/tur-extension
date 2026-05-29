@@ -181,6 +181,8 @@ function reportTarget() {
 
   if (signature === lastTargetSignature) return;
   lastTargetSignature = signature;
+  renderDebugOverlay(payload);
+
 
   safeSendMessage({
     type: "MEDIA_TARGET_UPDATE",
@@ -249,6 +251,7 @@ function buildTargetPayload(target) {
     videoHeight: metadata.height,
     duration: metadata.duration,
     frameUrl: window.location.href,
+    devicePixelRatio: window.devicePixelRatio,
   };
 }
 
@@ -281,6 +284,7 @@ function buildPagePayload() {
     videoHeight: 0,
     duration: null,
     frameUrl: window.location.href,
+    devicePixelRatio: window.devicePixelRatio,
   };
 }
 
@@ -590,6 +594,75 @@ function guessCategoryForElement(element) {
   if (element.localName === "audio") return "audio";
   if (element.localName === "video") return "video";
   return "download";
+}
+
+
+// ── Debug overlay boxes ──────────────────────────────────────────────
+// Red = target element, Blue = viewport, Yellow = button anchor position
+const DEBUG_OVERLAY = false;
+
+function renderDebugOverlay(payload) {
+  if (!DEBUG_OVERLAY || window !== window.top) return;
+  const root = ensureDebugRoot();
+  if (!root) return;
+  root.textContent = "";
+
+  const vw = Math.max(0, Number(payload.viewportWidth || 0));
+  const vh = Math.max(0, Number(payload.viewportHeight || 0));
+  const tw = Math.max(0, Number(payload.width || 0));
+  const th = Math.max(0, Number(payload.height || 0));
+  const tx = Math.max(0, Number(payload.clientX || 0) - tw);
+  const ty = Math.max(0, Number(payload.clientY || 0));
+
+  if (vw <= 0 || vh <= 0) return;
+
+  root.appendChild(makeDebugBox({
+    left: 0, top: 0, width: vw, height: vh,
+    border: "2px solid rgba(0, 120, 255, 0.5)",
+    background: "rgba(0, 120, 255, 0.08)",
+  }));
+
+  if (tw <= 0 || th <= 0) return;
+
+  root.appendChild(makeDebugBox({
+    left: tx, top: ty, width: tw, height: th,
+    border: "2px solid rgba(255, 50, 50, 0.7)",
+    background: "rgba(255, 50, 50, 0.10)",
+  }));
+
+  let ax = tx + tw - 226;
+  const ay = ty - 26 - 2;
+  ax = Math.max(0, Math.min(ax, Math.max(0, vw - 226)));
+
+  if (ay >= 0) {
+    root.appendChild(makeDebugBox({
+      left: ax, top: ay, width: 226, height: 26,
+      border: "2px solid rgba(255, 200, 0, 0.8)",
+      background: "rgba(255, 200, 0, 0.15)",
+    }));
+
+    const label = document.createElement("div");
+    label.textContent = "\u25E1 ANCHOR";
+    label.style.cssText = "position:absolute;left:" + Math.round(ax) + "px;top:" + Math.round(ay - 14) + "px;font:700 10px/1 ui-sans-serif,sans-serif;color:rgba(255,200,0,0.9);pointer-events:none;user-select:none;white-space:nowrap;z-index:2147483647;";
+    root.appendChild(label);
+  }
+}
+
+function ensureDebugRoot() {
+  let root = document.getElementById("tur-debug-overlay-root");
+  if (root) return root;
+  root = document.createElement("div");
+  root.id = "tur-debug-overlay-root";
+  root.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;overflow:hidden;";
+  if (!document.documentElement) return null;
+  document.documentElement.appendChild(root);
+  return root;
+}
+
+function makeDebugBox({ left, top, width, height, border, background }) {
+  const node = document.createElement("div");
+  node.style.cssText = "position:absolute;left:" + Math.round(left) + "px;top:" + Math.round(top) + "px;width:" + Math.max(0, Math.round(width)) + "px;height:" + Math.max(0, Math.round(height)) + "px;box-sizing:border-box;border:" + border + ";background:" + background + ";pointer-events:none;";
+  return node;
 }
 
 function safeRuntimeListener(listener) {
