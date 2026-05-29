@@ -38,6 +38,60 @@ chrome.runtime.onInstalled.addListener(setupOffscreenDocument);
 setupOffscreenDocument();
 initializeOverlayVisibilityState();
 
+// ── Programmatic injection: re-inject content script into existing tabs ──
+// Chromium only injects content_scripts on navigation. When the extension
+// is reloaded/updated, open tabs are left blind. This bridges the gap.
+chrome.runtime.onInstalled.addListener(async () => {
+  console.log("[Background] onInstalled — injecting content scripts into open tabs");
+  try {
+    const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+    
+    // Ping each tab first; skip tabs that already have the content script running
+    const pingResults = await Promise.allSettled(
+      tabs.map((t) =>
+        chrome.tabs.sendMessage(t.id, { type: "TUR_PING" }).catch(() => null)
+      )
+    );
+
+    const toInject = tabs.filter((_, i) => {
+      const r = pingResults[i];
+      return !(r.status === "fulfilled" && r.value?.ok);
+    });
+
+    if (toInject.length === 0) {
+      console.log("[Background] all", tabs.length, "tabs already have content script");
+      return;
+    }
+
+    console.log("[Background] injecting into", toInject.length, "of", tabs.length, "tabs");
+
+    await Promise.allSettled(
+      toInject.map(async (tab) => {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id, allFrames: true },
+            files: ["scripts/classifier.js", "scripts/content.js"],
+            injectImmediately: false,
+            world: "ISOLATED",
+          });
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id, allFrames: true },
+            files: ["scripts/inject.js"],
+            injectImmediately: true,
+            world: "MAIN",
+          });
+        } catch (tabErr) {
+          console.debug("[Background] inject skip tab", tab.id, tabErr);
+        }
+      })
+    );
+
+    console.log("[Background] injection complete");
+  } catch (err) {
+    console.warn("[Background] programmatic injection failed", err);
+  }
+});
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "keepAlive") {
     console.log("[Background] Keep-alive port connected from offscreen document.");

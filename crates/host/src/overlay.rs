@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ── constants ─────────────────────────────────────────────────────────────
 
-const BUTTON_WIDTH: i32 = 226;
+const BUTTON_WIDTH: i32 = 180;
 const BUTTON_HEIGHT: i32 = 26;
 const BUTTON_GAP: i32 = 2;
 const CORNER_RADIUS: i32 = 10;
@@ -114,33 +114,47 @@ pub fn update(update: CanvasUpdate) {
 
     let mut guard = canvas().lock().unwrap();
 
-    if update.targets.is_empty()
-        || update.viewport_width <= 0
-        || update.viewport_height <= 0
-    {
-        eprintln!("[tur] overlay: hiding (targets={}, vw={}, vh={})",
-            update.targets.len(), update.viewport_width, update.viewport_height);
+    if update.targets.is_empty() || update.viewport_width <= 0 || update.viewport_height <= 0 {
+        eprintln!(
+            "[tur] overlay: hiding (targets={}, vw={}, vh={})",
+            update.targets.len(),
+            update.viewport_width,
+            update.viewport_height
+        );
         if let Some(ref c) = *guard {
             unsafe {
                 let _ = ShowWindow(HWND(c.hwnd as *mut c_void), SW_HIDE);
             }
-            eprintln!("[tur] overlay: hidden hwnd={:?}", HWND(c.hwnd as *mut c_void));
+            eprintln!(
+                "[tur] overlay: hidden hwnd={:?}",
+                HWND(c.hwnd as *mut c_void)
+            );
         }
         return;
     }
 
-    eprintln!("[tur] overlay: update tab={} targets={} viewport=({},{},{}x{}) owner={}",
-        update.tab_id, update.targets.len(),
-        update.viewport_screen_x, update.viewport_screen_y,
-        update.viewport_width, update.viewport_height,
-        update.owner);
+    eprintln!(
+        "[tur] overlay: update tab={} targets={} viewport=({},{},{}x{}) owner={}",
+        update.tab_id,
+        update.targets.len(),
+        update.viewport_screen_x,
+        update.viewport_screen_y,
+        update.viewport_width,
+        update.viewport_height,
+        update.owner
+    );
     for (i, t) in update.targets.iter().enumerate() {
-        eprintln!("[tur] overlay:   [{}] id={} sx={} sy={} w={}",
-            i, t.element_id, t.screen_x, t.screen_y, t.width);
+        eprintln!(
+            "[tur] overlay:   [{}] id={} sx={} sy={} w={}",
+            i, t.element_id, t.screen_x, t.screen_y, t.width
+        );
     }
 
     if let Some(ref mut c) = *guard {
-        eprintln!("[tur] overlay: updating existing canvas hwnd={:?}", HWND(c.hwnd as *mut c_void));
+        eprintln!(
+            "[tur] overlay: updating existing canvas hwnd={:?}",
+            HWND(c.hwnd as *mut c_void)
+        );
         c.tab_id = update.tab_id;
         c.viewport_screen_x = update.viewport_screen_x;
         c.viewport_screen_y = update.viewport_screen_y;
@@ -171,26 +185,23 @@ pub fn update(update: CanvasUpdate) {
                 windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
                     .map(|m| m.0)
                     .unwrap_or_default(),
-            );                let owner = HWND(update.owner as *mut c_void);
+            );
+            let owner = HWND(update.owner as *mut c_void);
 
-                let hwnd = CreateWindowExW(
-                    WINDOW_EX_STYLE(
-                        WS_EX_TOPMOST.0
-                            | WS_EX_TOOLWINDOW.0
-                            | WS_EX_LAYERED.0,
-                    ),
-                    w!("TurOverlayCanvas"),
-                    w!("TurOverlay"),
-                    WINDOW_STYLE(WS_POPUP.0),
-                    update.viewport_screen_x,
-                    update.viewport_screen_y,
-                    update.viewport_width,
-                    update.viewport_height,
-                    owner,
-                    HMENU(null_mut()),
-                    instance,
-                    None,
-                );
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0),
+                w!("TurOverlayCanvas"),
+                w!("TurOverlay"),
+                WINDOW_STYLE(WS_POPUP.0),
+                update.viewport_screen_x,
+                update.viewport_screen_y,
+                update.viewport_width,
+                update.viewport_height,
+                owner,
+                HMENU(null_mut()),
+                instance,
+                None,
+            );
 
             match hwnd {
                 Ok(hwnd) => {
@@ -217,7 +228,10 @@ pub fn update(update: CanvasUpdate) {
                     });
 
                     let sw = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    eprintln!("[tur] overlay: ShowWindow(SW_SHOWNOACTIVATE) result={}", sw.as_bool());
+                    eprintln!(
+                        "[tur] overlay: ShowWindow(SW_SHOWNOACTIVATE) result={}",
+                        sw.as_bool()
+                    );
                 }
                 Err(e) => {
                     eprintln!("[tur] overlay: FAILED to create canvas window: {}", e);
@@ -231,7 +245,10 @@ pub fn update(update: CanvasUpdate) {
 pub fn hide() {
     let guard = canvas().lock().unwrap();
     if let Some(ref c) = *guard {
-        eprintln!("[tur] overlay: hide canvas hwnd={:?}", HWND(c.hwnd as *mut c_void));
+        eprintln!(
+            "[tur] overlay: hide canvas hwnd={:?}",
+            HWND(c.hwnd as *mut c_void)
+        );
         unsafe {
             let _ = ShowWindow(HWND(c.hwnd as *mut c_void), SW_HIDE);
         }
@@ -327,8 +344,10 @@ unsafe extern "system" fn canvas_wndproc(
                 eprintln!("[tur] overlay: WM_PAINT BeginPaint failed");
                 return LRESULT(0);
             }
-            eprintln!("[tur] overlay: WM_PAINT hwnd={:?} paint_rect=({},{})-({},{})",
-                hwnd, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
+            eprintln!(
+                "[tur] overlay: WM_PAINT hwnd={:?} paint_rect=({},{})-({},{})",
+                hwnd, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom
+            );
             let g = canvas().lock().unwrap();
             if let Some(ref state) = *g {
                 paint_canvas(hdc, state);
@@ -352,10 +371,15 @@ unsafe extern "system" fn canvas_wndproc(
 // ── painting helpers ─────────────────────────────────────────────────
 
 unsafe fn paint_canvas(hdc: HDC, state: &CanvasState) {
-    eprintln!("[tur] overlay: paint_canvas vp=({},{}) size=({}x{}) targets={} dpr={}",
-        state.viewport_screen_x, state.viewport_screen_y,
-        state.viewport_width, state.viewport_height,
-        state.targets.len(), state.dpr);
+    eprintln!(
+        "[tur] overlay: paint_canvas vp=({},{}) size=({}x{}) targets={} dpr={}",
+        state.viewport_screen_x,
+        state.viewport_screen_y,
+        state.viewport_width,
+        state.viewport_height,
+        state.targets.len(),
+        state.dpr
+    );
 
     // Compute DPR-scaled button dimensions so they match CSS-pixel positions
     // from the debug overlay.
@@ -383,13 +407,13 @@ unsafe fn paint_canvas(hdc: HDC, state: &CanvasState) {
         // Button position relative to the canvas (which is at viewport_screen_*).
         // btn_x = dpr * (clientX - bw)  — same as debug overlay's (clientX - 226) in CSS px
         // btn_y = dpr * (clientY - bh - bg) — same as debug overlay's (clientY - 28) in CSS px
-        let btn_x = target.screen_x + target.width - bw
-            - state.viewport_screen_x;
-        let btn_y = target.screen_y - bh - bg
-            - state.viewport_screen_y;
+        let btn_x = target.screen_x + target.width - bw - state.viewport_screen_x;
+        let btn_y = target.screen_y - bh - bg - state.viewport_screen_y;
 
-        eprintln!("[tur] overlay: target {} -> btn at ({}, {}) bw={} bh={}",
-            target.element_id, btn_x, btn_y, bw, bh);
+        eprintln!(
+            "[tur] overlay: target {} -> btn at ({}, {}) bw={} bh={}",
+            target.element_id, btn_x, btn_y, bw, bh
+        );
 
         // SKIP clipping for now — we want to SEE where the button renders,
         // even if it's partially off-canvas. Re-enable after debug boxes confirm
@@ -427,8 +451,10 @@ unsafe fn paint_button(hdc: HDC, x: i32, y: i32, w: i32, h: i32, cr: i32, is_dar
         )
     };
 
-    eprintln!("[tur] overlay:   paint_button at ({},{}) dark={} size={}x{} cr={}",
-        x, y, is_dark, w, h, cr);
+    eprintln!(
+        "[tur] overlay:   paint_button at ({},{}) dark={} size={}x{} cr={}",
+        x, y, is_dark, w, h, cr
+    );
 
     // Fill background
     let bg_brush = CreateSolidBrush(bg);
@@ -440,11 +466,7 @@ unsafe fn paint_button(hdc: HDC, x: i32, y: i32, w: i32, h: i32, cr: i32, is_dar
     let old_pen = SelectObject(hdc, HGDIOBJ(border_pen.0));
     let old_brush = SelectObject(hdc, HGDIOBJ(GetStockObject(NULL_BRUSH).0));
 
-    let _ = RoundRect(
-        hdc,
-        rect.left, rect.top, rect.right, rect.bottom,
-        cr, cr,
-    );
+    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, cr, cr);
 
     let _ = SelectObject(hdc, old_brush);
     let _ = SelectObject(hdc, old_pen);
@@ -459,8 +481,7 @@ unsafe fn paint_button(hdc: HDC, x: i32, y: i32, w: i32, h: i32, cr: i32, is_dar
     let text_pad = (12.0 * (w as f64) / BUTTON_WIDTH as f64).round() as i32;
     let mut text_rect = rect;
     text_rect.left += text_pad;
-    let mut text: Vec<u16> =
-        "Download with tur".encode_utf16().chain(Some(0)).collect();
+    let mut text: Vec<u16> = "Download with tur".encode_utf16().chain(Some(0)).collect();
     let dt = DrawTextW(
         hdc,
         &mut text,
@@ -484,11 +505,7 @@ unsafe fn is_over_button(state: &CanvasState, screen_x: i32, screen_y: i32) -> b
         let bx = target.screen_x + target.width - bw;
         let by = target.screen_y - bh - bg;
 
-        if screen_x >= bx
-            && screen_x < bx + bw
-            && screen_y >= by
-            && screen_y < by + bh
-        {
+        if screen_x >= bx && screen_x < bx + bw && screen_y >= by && screen_y < by + bh {
             return true;
         }
     }

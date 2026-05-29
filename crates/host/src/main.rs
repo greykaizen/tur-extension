@@ -129,7 +129,7 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
 }
 
 fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String> {
-    let dpr = msg["devicePixelRatio"].as_f64().unwrap_or(1.0);
+    let dpr = msg["devicePixelRatio"].as_f64().unwrap_or(1.0).max(1.0);
     let raw_targets = msg["targets"].as_array().ok_or("missing targets array")?;
     let mut targets = Vec::with_capacity(raw_targets.len());
 

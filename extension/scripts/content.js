@@ -21,6 +21,9 @@ const intersectionObserver = new IntersectionObserver(scheduleTargetReport, {
 const resizeObserver = new ResizeObserver(scheduleTargetReport);
 
 safeRuntimeListener((message) => {
+  if (message.type === "TUR_PING") {
+    return { ok: true };
+  }
   if (message.type !== "MEDIA_DETECTED_NETWORK") return;
   rememberMedia(message.url, message.mediaType, message.pageUrl, message.category, "network");
 });
