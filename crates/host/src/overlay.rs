@@ -874,27 +874,22 @@ unsafe extern "system" fn canvas_wndproc(
 }
 
 /// Returns the hit zone for a screen coordinate over any HUD button.
-/// Uses the same clamped positioning logic as draw_hud so clicks land correctly.
+/// Uses `hud_screen_pos` so the hide-above-viewport rule is consistent.
 /// (Kept for potential future use; input routing is handled via SetWindowRgn.)
 #[allow(dead_code)]
 fn hit_zone(state: &CanvasState, sx: i32, sy: i32) -> HitZone {
     if let Some(ref gpu) = state.gpu {
-        let dpr = state.dpr as f32;
-        let hud_w = (gpu.hud_width  * dpr) as i32;
-        let hud_h = (HUD_H         * dpr) as i32;
-        let hud_gap = (HUD_GAP     * dpr) as i32;
-        let pill_x = (PILL_START_X * dpr) as i32;
+        let dpr    = state.dpr as f32;
+        let hud_w  = (gpu.hud_width  * dpr) as i32;
+        let hud_h  = (HUD_H          * dpr) as i32;
+        let pill_x = (PILL_START_X   * dpr) as i32;
         let x_off  = ((PILL_START_X + PILL_PAD_X + gpu.text_width + PILL_PAD_X + PILL_GAP_M) * dpr) as i32;
 
-        for (i, t) in state.targets.iter().enumerate() {
-            let (dx, dy) = effective_offset(state, i);
-            let bx = t.screen_x + t.width - hud_w + dx;
-            // Clamp HUD Y: if the video is too close to the viewport top, show HUD
-            // *below* the video top edge instead (prevents the button from going
-            // above the window rect where it would be invisible and unhittable).
-            let ideal_by = t.screen_y - hud_h - hud_gap + dy;
-            let vp_top   = state.viewport_screen_y;
-            let by = ideal_by.max(vp_top);
+        for i in 0..state.targets.len() {
+            let (bx, by) = match hud_screen_pos(state, i) {
+                Some(p) => p,
+                None    => continue, // button hidden — not hittable
+            };
             if sx < bx || sx >= bx + hud_w || sy < by || sy >= by + hud_h { continue; }
             let lx = sx - bx;
             return if lx < pill_x      { HitZone::Drag }
@@ -914,6 +909,32 @@ fn effective_offset(state: &CanvasState, idx: usize) -> (i32, i32) {
     } else {
         base
     }
+}
+
+/// Compute the screen-space top-left of the HUD button for a given target.
+///
+/// Returns `None` when the button would sit above the viewport top edge,
+/// matching the debug overlay rule: yellow box only drawn when `ay >= 0`.
+/// When `None` the button is neither rendered nor included in the input region.
+fn hud_screen_pos(state: &CanvasState, idx: usize) -> Option<(i32, i32)> {
+    let gpu = state.gpu.as_ref()?;
+    let dpr     = state.dpr as f32;
+    let hud_w   = (gpu.hud_width * dpr) as i32;
+    let hud_h   = (HUD_H         * dpr) as i32;
+    let hud_gap = (HUD_GAP       * dpr) as i32;
+    let t       = state.targets.get(idx)?;
+    let (dx, dy) = effective_offset(state, idx);
+
+    let bx      = t.screen_x + t.width - hud_w + dx;
+    let ideal_by = t.screen_y - hud_h - hud_gap + dy;
+
+    // Hide the button entirely when it would clip above the viewport top.
+    // This matches the JS debug overlay: yellow box only drawn when ay >= 0.
+    if ideal_by < state.viewport_screen_y {
+        return None;
+    }
+
+    Some((bx, ideal_by))
 }
 
 /// Restrict the overlay window's input region to only the HUD button rects.
@@ -957,21 +978,21 @@ unsafe fn update_window_region(hwnd: HWND, state: &CanvasState) {
         return;
     }
 
-    let dpr     = state.dpr as f32;
-    let hud_w   = (gpu.hud_width * dpr) as i32;
-    let hud_h   = (HUD_H         * dpr) as i32;
-    let hud_gap = (HUD_GAP       * dpr) as i32;
-    let vp_x    = state.viewport_screen_x;
-    let vp_y    = state.viewport_screen_y;
+    let dpr   = state.dpr as f32;
+    let hud_w = (gpu.hud_width * dpr) as i32;
+    let hud_h = (HUD_H         * dpr) as i32;
+    let vp_x  = state.viewport_screen_x;
+    let vp_y  = state.viewport_screen_y;
 
-    // Start with an empty region and OR-in each HUD button rect.
+    // Start with an empty region and OR-in each visible HUD button rect.
     let combined = CreateRectRgn(0, 0, 0, 0);
 
-    for (i, t) in state.targets.iter().enumerate() {
-        let (dx, dy) = effective_offset(state, i);
-        let bx      = t.screen_x + t.width - hud_w + dx;
-        let ideal_by = t.screen_y - hud_h - hud_gap + dy;
-        let by      = ideal_by.max(vp_y);
+    for i in 0..state.targets.len() {
+        // hud_screen_pos() returns None when the button is above the viewport.
+        let (bx, by) = match hud_screen_pos(state, i) {
+            Some(p) => p,
+            None    => continue, // button hidden — exclude from input region
+        };
 
         // Convert from screen coords to window-client coords.
         let rx = bx - vp_x;
@@ -994,15 +1015,25 @@ unsafe fn do_render(state: &mut CanvasState) {
         None => return,
     };
     let ctx = &gpu.d2d_ctx;
-    let dpr = state.dpr as f32;
+    let _dpr = state.dpr as f32;
 
     ctx.BeginDraw();
     // Clear to fully transparent — DComp composites this over the desktop.
     ctx.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
 
-    for (i, target) in state.targets.iter().enumerate() {
+    let dpr = state.dpr as f32;
+    let vx  = state.viewport_screen_x as f32;
+    let vy  = state.viewport_screen_y as f32;
+
+    for i in 0..state.targets.len() {
+        // Skip buttons that are above the viewport top (match debug overlay rule).
+        let (bx_phys, by_phys) = match hud_screen_pos(state, i) {
+            Some((bx, by)) => (bx as f32, by as f32),
+            None           => continue,
+        };
+        let target = &state.targets[i];
         let (dx, dy) = effective_offset(state, i);
-        draw_hud(ctx, gpu, state, target, dpr, dx, dy);
+        draw_hud(ctx, gpu, state, target, dpr, dx, dy, bx_phys, by_phys, vx, vy);
     }
 
     if let Err(e) = ctx.EndDraw(None, None) {
@@ -1023,33 +1054,24 @@ unsafe fn do_render(state: &mut CanvasState) {
 }
 
 /// Draw one HUD button for `target` at its effective screen position.
+/// `bx_phys` / `by_phys` are pre-computed physical screen coords from `hud_screen_pos`.
 unsafe fn draw_hud(
     ctx: &ID2D1DeviceContext,
     gpu: &GpuState,
     state: &CanvasState,
-    target: &TargetInfo,
+    _target: &TargetInfo,
     dpr: f32,
-    dx: i32,
-    dy: i32,
+    _dx: i32,
+    _dy: i32,
+    bx_phys: f32,
+    by_phys: f32,
+    vx: f32,
+    vy: f32,
 ) {
     let hud_w = gpu.hud_width;
     let hud_h = HUD_H;
-    let gap   = HUD_GAP;
 
-    // Button position in D2D DIPs (origin = viewport top-left)
-    let vx = state.viewport_screen_x as f32;
-    let vy = state.viewport_screen_y as f32;
-    let phys_hud_w = hud_w * dpr;
-    let phys_hud_h = hud_h * dpr;
-    let phys_gap   = gap * dpr;
-
-    // Screen position → DIP position relative to our canvas window
-    let bx_phys = (target.screen_x + target.width) as f32 - phys_hud_w + dx as f32;
-    // Clamp: if the video top is too close to the viewport top, keep the HUD
-    // visible inside the window rect rather than clipping it above.
-    let ideal_by_phys = target.screen_y as f32 - phys_hud_h - phys_gap + dy as f32;
-    let by_phys = ideal_by_phys.max(vy);
-    // Convert to DIPs
+    // Convert physical screen coords to DIPs relative to our canvas window origin.
     let bx = (bx_phys - vx) / dpr;
     let by = (by_phys - vy) / dpr;
 
