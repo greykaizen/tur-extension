@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "TUR Download Manager Interceptor",
+  "version": "0.1.0",
+  "description": "Seamlessly intercepts media streams and downloads, sending them directly to TUR Download Manager.",
+  "permissions": [
+    "contextMenus",
+    "webRequest",
+    "nativeMessaging",
+    "storage",
+    "offscreen",
+    "windows"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "scripts/background.js"
+  },
+  "action": {
+    "default_title": "Download with Tur",
+    "default_icon": {
+      "32": "icons/32x32.png",
+      "64": "icons/64x64.png",
+      "128": "icons/128x128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["scripts/classifier.js", "scripts/content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["scripts/inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "32": "icons/32x32.png",
+    "64": "icons/64x64.png",
+    "128": "icons/128x128.png"
+  }
+}
+
