@@ -51,38 +51,6 @@ pub unsafe fn find_chromium_root_for_point(screen_x: i32, screen_y: i32) -> Opti
     search.result
 }
 
-/// Given a top-level Chrome_WidgetWin_1/0 HWND, find the child window that
-/// represents the actual web content rendering surface (Chrome_RenderWidgetHostHWND).
-pub unsafe fn find_chromium_content_surface(root: HWND) -> Option<HWND> {
-    struct Search {
-        result: Option<HWND>,
-    }
-
-    unsafe extern "system" fn enum_child_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let search = &mut *(lparam.0 as *mut Search);
-        let class = get_class_name(hwnd);
-
-        if class == "Chrome_RenderWidgetHostHWND"
-            || class == "Chrome_WebViewWindow"
-        {
-            search.result = Some(hwnd);
-            return false.into();
-        }
-
-        true.into()
-    }
-
-    let mut search = Search { result: None };
-
-    let _ = EnumChildWindows(
-        root,
-        Some(enum_child_proc),
-        LPARAM((&mut search as *mut Search) as isize),
-    );
-
-    search.result
-}
-
 /// Get the class name of an HWND.
 unsafe fn get_class_name(hwnd: HWND) -> String {
     let mut buffer = [0u16; 256];

@@ -1,0 +1,7 @@
+{
+  "name": "com.tur.native_host",
+  "description": "tur Download Manager native messaging host",
+  "path": "PLACEHOLDER_REPLACED_BY_INSTALL_PS1",
+  "type": "stdio",
+  "allowed_extensions": ["tur@project.local"]
+}

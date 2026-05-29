@@ -1,24 +1,24 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "TUR Download Manager Interceptor",
   "version": "0.1.0",
   "description": "Seamlessly intercepts media streams and downloads, sending them directly to TUR Download Manager.",
   "permissions": [
     "contextMenus",
     "webRequest",
+    "webRequestBlocking",
     "nativeMessaging",
     "storage",
-    "offscreen",
     "windows",
-    "scripting"
-  ],
-  "host_permissions": [
+    "scripting",
+    "activeTab",
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "scripts/background.js"
+    "scripts": ["scripts/background.js"],
+    "persistent": false
   },
-  "action": {
+  "browser_action": {
     "default_title": "Download with Tur",
     "default_icon": {
       "32": "icons/32x32.png",
@@ -37,7 +37,6 @@
       "matches": ["<all_urls>"],
       "js": ["scripts/inject.js"],
       "run_at": "document_start",
-      "world": "MAIN",
       "all_frames": true
     }
   ],
@@ -49,8 +48,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "tur@project.local",
-      "strict_min_version": "109.0"
+      "strict_min_version": "78.0"
     }
   }
 }
-

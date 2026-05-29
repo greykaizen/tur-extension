@@ -6,6 +6,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod overlay;
 mod window;
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// Parsed geometry update from the extension (MEDIA_TARGETS_UPDATE).
 #[derive(Debug, Clone)]
@@ -29,7 +31,9 @@ struct TargetPayload {
     height: i32,
     screen_x: i32,
     screen_y: i32,
-    _media_url: String,
+    media_url: String,
+    drag_offset_x: i32,
+    drag_offset_y: i32,
 }
 
 fn main() {
@@ -40,9 +44,25 @@ fn main() {
         );
     }
 
+    // COM must be initialised exactly once at the process root, before ANY
+    // COM object creation (D2D factory, WIC imaging factory, DComp device).
+    // Calling CoInitializeEx inside a helper function is an anti-pattern that
+    // causes silent RPC_E_CHANGED_MODE failures if the apartment type differs.
+    unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        )
+        .ok() // S_FALSE is acceptable (already initialized) — only panic on true failure
+        .expect("CoInitializeEx failed — cannot proceed without COM apartment");
+    }
+
     // Initialise the canvas overlay system.
+    #[cfg(not(target_os = "macos"))]
     overlay::init();
-    eprintln!("[tur] single canvas overlay initialised");
+    #[cfg(target_os = "macos")]
+    macos::init();
+    eprintln!("[tur] overlay system initialised");
 
     // Channel: stdin worker -> main thread.
     let (tx, rx) = mpsc::channel::<TargetsUpdate>();
@@ -151,7 +171,9 @@ fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String
             height,
             screen_x,
             screen_y,
-            _media_url,
+            media_url: t["mediaUrl"].as_str().unwrap_or("").to_string(),
+            drag_offset_x: t["dragOffsetX"].as_i64().unwrap_or(0) as i32,
+            drag_offset_y: t["dragOffsetY"].as_i64().unwrap_or(0) as i32,
         });
     }
 
@@ -242,6 +264,7 @@ unsafe fn run_message_pump(rx: mpsc::Receiver<TargetsUpdate>) {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     overlay::destroy();
     let _ = DestroyWindow(controller);
     let _ = Box::from_raw(rx_ptr);
@@ -272,7 +295,10 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         || update.viewport_width <= 0
         || update.viewport_height <= 0
     {
+        #[cfg(not(target_os = "macos"))]
         overlay::hide();
+        #[cfg(target_os = "macos")]
+        macos::hide();
         return;
     }
 
@@ -303,13 +329,17 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         .iter()
         .map(|t| overlay::TargetInfo {
             element_id: t.element_id.clone(),
-            screen_x: t.screen_x,
-            screen_y: t.screen_y,
-            width: t.width,
-            _height: t.height,
+            screen_x:   t.screen_x,
+            screen_y:   t.screen_y,
+            width:      t.width,
+            _height:    t.height,
+            media_url:  t.media_url.clone(),
+            drag_offset_x: t.drag_offset_x,
+            drag_offset_y: t.drag_offset_y,
         })
         .collect();
 
+    #[cfg(not(target_os = "macos"))]
     overlay::update(overlay::CanvasUpdate {
         tab_id: update.tab_id,
         viewport_screen_x: update.viewport_screen_x,
@@ -317,8 +347,20 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         viewport_width: update.viewport_width,
         viewport_height: update.viewport_height,
         device_pixel_ratio: update._device_pixel_ratio,
-        targets: overlay_targets,
+        targets: overlay_targets.clone(),
         owner: owner.0 as isize,
+        is_dark,
+    });
+    #[cfg(target_os = "macos")]
+    macos::update(overlay::CanvasUpdate {
+        tab_id: update.tab_id,
+        viewport_screen_x: update.viewport_screen_x,
+        viewport_screen_y: update.viewport_screen_y,
+        viewport_width: update.viewport_width,
+        viewport_height: update.viewport_height,
+        device_pixel_ratio: update._device_pixel_ratio,
+        targets: overlay_targets,
+        owner: 0,
         is_dark,
     });
 }
