@@ -14,6 +14,7 @@ let rafId = 0;
 let lastTargetSignature = "";
 let lastCandidatesSignature = "";
 let elementIdCounter = 0;
+let targetReportTimeoutId = null;
 
 const intersectionObserver = new IntersectionObserver(scheduleTargetReport, {
   threshold: [0, 0.2, 0.5, 0.9],
@@ -219,8 +220,7 @@ function processMediaElement(element) {
           rememberElementSource(element, "mutation");
         }
         // Instantly trigger collectAllTargets, flush the old target states, and dispatch
-        lastTargetSignature = "";
-        reportTargets();
+        scheduleTargetReport();
       }
     });
     observer.observe(element, {
@@ -272,11 +272,19 @@ function reportCandidates() {
 }
 
 function scheduleTargetReport() {
-  if (!extensionAlive || rafId) return;
-  rafId = requestAnimationFrame(() => {
-    rafId = 0;
-    reportTargets();
-  });
+  if (!extensionAlive) return;
+  if (targetReportTimeoutId) {
+    clearTimeout(targetReportTimeoutId);
+  }
+  targetReportTimeoutId = setTimeout(() => {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+    }
+    rafId = requestAnimationFrame(() => {
+      rafId = 0;
+      reportTargets();
+    });
+  }, 10);
 }
 
 function reportTargets() {

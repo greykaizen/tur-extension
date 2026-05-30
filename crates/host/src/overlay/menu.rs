@@ -187,7 +187,47 @@ pub unsafe fn show_quality_menu(
         let _ = AppendMenuW(menu, MF_STRING, 10000, PCWSTR(label.as_ptr()));
     } else {
         for (idx, f) in formats.iter().enumerate() {
-            let label_str = format!("{}. {}", idx + 1, f.label);
+            // Reconstruct/clean label to guarantee no "0Mb" or "0:00" or "~0" or empty artifacts
+            let mut label_parts = Vec::new();
+            
+            // Extract the media type (e.g. "MP4", "TS", "M3U8", etc.)
+            let type_str = f.label.split(" | ").next().unwrap_or("VIDEO").trim();
+            label_parts.push(type_str.to_string());
+            
+            if !f.resolution.is_empty() && f.resolution != "0x0" {
+                label_parts.push(f.resolution.clone());
+            }
+            
+            if let Some(ref dur) = f.duration {
+                let dur_trimmed = dur.trim();
+                if !dur_trimmed.is_empty() && dur_trimmed != "0" && dur_trimmed != "0sec" && dur_trimmed != "0:00" {
+                    label_parts.push(dur_trimmed.to_string());
+                }
+            }
+            
+            if let Some(ref sz) = f.size {
+                let sz_trimmed = sz.trim();
+                if !sz_trimmed.is_empty() && sz_trimmed != "0" && sz_trimmed != "0 B" && sz_trimmed != "0KB" && sz_trimmed != "0MB" && sz_trimmed != "0GB" && !sz_trimmed.contains("~0") {
+                    label_parts.push(sz_trimmed.to_string());
+                }
+            }
+            
+            // If the reconstruction only contains TYPE block, check if there is other info in the original f.label
+            let final_label = if label_parts.len() <= 1 {
+                let cleaned: Vec<&str> = f.label.split(" | ")
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && *s != "0" && *s != "0sec" && *s != "0:00" && *s != "0 B" && *s != "0KB" && *s != "0MB" && *s != "0GB" && !s.contains("~0"))
+                    .collect();
+                if cleaned.len() <= 1 && !f.label.is_empty() {
+                    f.label.clone()
+                } else {
+                    cleaned.join(" | ")
+                }
+            } else {
+                label_parts.join(" | ")
+            };
+
+            let label_str = format!("{}. {}", idx + 1, final_label);
             let label = wstr!(&label_str);
             let _ = AppendMenuW(
                 menu,

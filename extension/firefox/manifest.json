@@ -14,10 +14,7 @@
     "<all_urls>"
   ],
   "background": {
-    "scripts": [
-      "scripts/classifier.js",
-      "scripts/background.js"
-    ]
+    "service_worker": "scripts/background.js"
   },
   "action": {
     "default_title": "Download with Tur",
@@ -29,14 +26,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["*://*/*"],
       "js": ["scripts/classifier.js", "scripts/content.js"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true,
       "match_about_blank": true
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": ["*://*/*"],
       "js": ["scripts/inject.js"],
       "run_at": "document_start",
       "world": "MAIN",

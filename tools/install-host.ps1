@@ -54,7 +54,7 @@ Write-Host "  Custom fonts installed." -ForegroundColor Green
 # 3. Generate & Register Chromium Native Messaging Host Manifest
 $origins = @(
     "chrome-extension://nkilabbnigegcggilmdjaepemndfance/", # Default developer ID
-    "chrome-extension://pfchlobngiipcgldghcmbhnbakbnnhfg/"  # User's Brave ID
+    "chrome-extension://omhacdegdipjjakobgakailcbgbhgbpd/"  # User's Brave ID
 )
 if ($origins -notcontains "chrome-extension://$ExtensionId/") {
     $origins += "chrome-extension://$ExtensionId/"

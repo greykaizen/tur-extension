@@ -188,6 +188,8 @@ fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String
                     video_url: f["videoUrl"].as_str().unwrap_or("").to_string(),
                     audio_url: f["audioUrl"].as_str().unwrap_or("").to_string(),
                     resolution: f["resolution"].as_str().unwrap_or("").to_string(),
+                    size: f["size"].as_str().map(|s| s.to_string()),
+                    duration: f["duration"].as_str().map(|s| s.to_string()),
                 });
             }
         }

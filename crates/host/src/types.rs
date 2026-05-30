@@ -24,6 +24,8 @@ pub struct FormatInfo {
     pub video_url: String,
     pub audio_url: String,
     pub resolution: String,
+    pub size: Option<String>,
+    pub duration: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

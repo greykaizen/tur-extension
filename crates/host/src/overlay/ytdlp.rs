@@ -289,11 +289,15 @@ fn parse_ytdlp_json(json_str: &str) -> Vec<FormatInfo> {
                 };
                 
                 let label = make_label(ext, width, height, duration, combined_size, combined_tbr);
+                let size_opt = combined_size.and_then(format_size_str);
+                let duration_opt = format_duration_str(duration);
                 results.push(FormatInfo {
                     label,
                     video_url: v.url.clone(),
                     audio_url: audio.url.clone(),
                     resolution: format!("{}x{}", width, height),
+                    size: size_opt,
+                    duration: duration_opt,
                 });
             }
         }
@@ -305,11 +309,15 @@ fn parse_ytdlp_json(json_str: &str) -> Vec<FormatInfo> {
             let tbr = m.tbr.unwrap_or(0.0);
             
             let label = make_label(ext, width, height, duration, m.filesize, tbr);
+            let size_opt = m.filesize.and_then(format_size_str);
+            let duration_opt = format_duration_str(duration);
             results.push(FormatInfo {
                 label,
                 video_url: m.url.clone(),
                 audio_url: String::new(),
                 resolution: format!("{}x{}", width, height),
+                size: size_opt,
+                duration: duration_opt,
             });
         }
         
@@ -329,12 +337,16 @@ fn parse_ytdlp_json(json_str: &str) -> Vec<FormatInfo> {
             let tbr = parsed.tbr.unwrap_or(0.0);
             
             let label = make_label(ext, width, height, duration, parsed.filesize, tbr);
+            let size_opt = parsed.filesize.and_then(format_size_str);
+            let duration_opt = format_duration_str(duration);
             log_ytdlp(&format!("Parsed single-stream flat format: {}x{} {}", width, height, ext));
             return vec![FormatInfo {
                 label,
                 video_url: url,
                 audio_url: String::new(),
                 resolution: format!("{}x{}", width, height),
+                size: size_opt,
+                duration: duration_opt,
             }];
         }
     }
@@ -397,25 +409,84 @@ fn make_label(
     };
 
     if let Some(bytes) = computed_size {
-        if bytes < 1024 * 1024 {
-            let kb = bytes as f64 / 1024.0;
-            parts.push(format!("{:.0}KB", kb.round()));
-        } else if bytes < 1024 * 1024 * 1024 {
-            let mb = bytes as f64 / (1024.0 * 1024.0);
-            if (mb * 10.0).round() % 10.0 == 0.0 {
-                parts.push(format!("{:.0}MB", mb));
+        if bytes > 0 {
+            if bytes < 1024 {
+                parts.push(format!("{} B", bytes));
+            } else if bytes < 1024 * 1024 {
+                let kb = bytes as f64 / 1024.0;
+                if (kb * 10.0).round() % 10.0 == 0.0 {
+                    parts.push(format!("{:.0}KB", kb));
+                } else {
+                    parts.push(format!("{:.1}KB", kb));
+                }
+            } else if bytes < 1024 * 1024 * 1024 {
+                let mb = bytes as f64 / (1024.0 * 1024.0);
+                if (mb * 10.0).round() % 10.0 == 0.0 {
+                    parts.push(format!("{:.0}MB", mb));
+                } else {
+                    parts.push(format!("{:.1}MB", mb));
+                }
             } else {
-                parts.push(format!("{:.1}MB", mb));
+                let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                if (gb * 100.0).round() % 100.0 == 0.0 {
+                    parts.push(format!("{:.0}GB", gb));
+                } else {
+                    parts.push(format!("{:.2}GB", gb));
+                }
             }
-        } else {
-            let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            parts.push(format!("{:.2}GB", gb));
         }
     }
 
     parts.join(" | ")
 }
 
+fn format_duration_str(duration_secs: f64) -> Option<String> {
+    if duration_secs <= 0.0 {
+        return None;
+    }
+    let total_secs = duration_secs.round() as u64;
+    if total_secs == 0 {
+        return None;
+    }
+    if total_secs < 60 {
+        Some(format!("{}sec", total_secs))
+    } else if total_secs < 3600 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        Some(format!("{}min {}sec", mins, secs))
+    } else {
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        Some(format!("{}hr {}min", hours, mins))
+    }
+}
 
-
-
+fn format_size_str(size_bytes: u64) -> Option<String> {
+    if size_bytes == 0 {
+        return None;
+    }
+    if size_bytes < 1024 {
+        Some(format!("{} B", size_bytes))
+    } else if size_bytes < 1024 * 1024 {
+        let kb = size_bytes as f64 / 1024.0;
+        if (kb * 10.0).round() % 10.0 == 0.0 {
+            Some(format!("{:.0}KB", kb))
+        } else {
+            Some(format!("{:.1}KB", kb))
+        }
+    } else if size_bytes < 1024 * 1024 * 1024 {
+        let mb = size_bytes as f64 / (1024.0 * 1024.0);
+        if (mb * 10.0).round() % 10.0 == 0.0 {
+            Some(format!("{:.0}MB", mb))
+        } else {
+            Some(format!("{:.1}MB", mb))
+        }
+    } else {
+        let gb = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        if (gb * 100.0).round() % 100.0 == 0.0 {
+            Some(format!("{:.0}GB", gb))
+        } else {
+            Some(format!("{:.2}GB", gb))
+        }
+    }
+}

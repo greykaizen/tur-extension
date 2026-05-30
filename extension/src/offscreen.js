@@ -121,6 +121,8 @@ function resolveUrl(base, relative) {
 
 // Unified Option String Formatting Engine
 // Schema: "[TYPE] | WidthxHeight | Xmin Ysec | Bitratekbps | ~SizeMB"
+// Unified Option String Formatting Engine
+// Schema: "[TYPE] | WidthxHeight | Xmin Ysec | Bitratekbps | SizeMB"
 function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) {
   const typeStr = (type || "VIDEO").toUpperCase();
   const parts = [typeStr];
@@ -132,20 +134,8 @@ function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) 
   }
 
   if (durationSecs > 0) {
-    const totalSecs = Math.round(durationSecs);
-    if (totalSecs > 0) {
-      if (totalSecs < 60) {
-        parts.push(`${totalSecs}sec`);
-      } else if (totalSecs < 3600) {
-        const mins = Math.floor(totalSecs / 60);
-        const secs = totalSecs % 60;
-        parts.push(`${mins}min ${secs}sec`);
-      } else {
-        const hours = Math.floor(totalSecs / 3600);
-        const mins = Math.floor((totalSecs % 3600) / 60);
-        parts.push(`${hours}hr ${mins}min`);
-      }
-    }
+    const durStr = formatDurationStr(durationSecs);
+    if (durStr) parts.push(durStr);
   }
 
   if (bitrateKbps > 0) {
@@ -158,18 +148,43 @@ function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) 
   }
 
   if (computedSize > 0) {
-    if (computedSize < 1024 * 1024) {
-      parts.push(`${Math.round(computedSize / 1024)}KB`);
-    } else if (computedSize < 1024 * 1024 * 1024) {
-      const mb = computedSize / (1024 * 1024);
-      parts.push(`${mb % 1 === 0 ? mb : mb.toFixed(1)}MB`);
-    } else {
-      const gb = computedSize / (1024 * 1024 * 1024);
-      parts.push(`${gb.toFixed(2)}GB`);
-    }
+    const szStr = formatSizeStr(computedSize);
+    if (szStr) parts.push(szStr);
   }
 
   return parts.join(" | ");
+}
+
+function formatDurationStr(durationSecs) {
+  if (!(durationSecs > 0)) return null;
+  const totalSecs = Math.round(durationSecs);
+  if (totalSecs < 60) {
+    return `${totalSecs}sec`;
+  } else if (totalSecs < 3600) {
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
+    return `${mins}min ${secs}sec`;
+  } else {
+    const hours = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    return `${hours}hr ${mins}min`;
+  }
+}
+
+function formatSizeStr(sizeBytes) {
+  if (!(sizeBytes > 0)) return null;
+  if (sizeBytes < 1024) {
+    return `${Math.round(sizeBytes)} B`;
+  } else if (sizeBytes < 1024 * 1024) {
+    const kb = sizeBytes / 1024;
+    return `${kb % 1 === 0 ? kb : kb.toFixed(1)}KB`;
+  } else if (sizeBytes < 1024 * 1024 * 1024) {
+    const mb = sizeBytes / (1024 * 1024);
+    return `${mb % 1 === 0 ? mb : mb.toFixed(1)}MB`;
+  } else {
+    const gb = sizeBytes / (1024 * 1024 * 1024);
+    return `${gb.toFixed(2)}GB`;
+  }
 }
 
 function parseHLS(playlistText, manifestUrl, isTsMime) {
@@ -201,12 +216,14 @@ function parseHLS(playlistText, manifestUrl, isTsMime) {
         bandwidth = parseInt(bwMatch[1], 10);
       }
 
-      const label = makeJSLabel(typeLabel, width, height, 0, 0, 0);
+      const label = makeJSLabel(typeLabel, width, height, 0, bandwidth / 1000, 0);
       formats.push({
         label,
         videoUrl: variantUrl,
         audioUrl: "",
         resolution: `${width}x${height}`,
+        size: null,
+        duration: null
       });
 
       currentStreamInf = null;
@@ -258,6 +275,8 @@ function parseHLS(playlistText, manifestUrl, isTsMime) {
       videoUrl: manifestUrl,
       audioUrl: "",
       resolution: "",
+      size: formatSizeStr((bitrateKbps * 1000 * totalDuration) / 8) || null,
+      duration: formatDurationStr(totalDuration) || null
     });
   }
   return formats;
@@ -333,12 +352,13 @@ function parseDASH(xmlText, manifestUrl, duration) {
     }
     
     for (const v of videoRepresentations) {
+      const bitrateKbps = v.bandwidth / 1000;
       const label = makeJSLabel(
         "DASH",
         v.width,
         v.height,
-        0,
-        0,
+        duration,
+        bitrateKbps,
         0
       );
       
@@ -347,6 +367,8 @@ function parseDASH(xmlText, manifestUrl, duration) {
         videoUrl: v.url,
         audioUrl: bestAudio ? bestAudio.url : "",
         resolution: `${v.width}x${v.height}`,
+        size: formatSizeStr((bitrateKbps * 1000 * duration) / 8) || null,
+        duration: formatDurationStr(duration) || null
       });
     }
   }

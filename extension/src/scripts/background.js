@@ -137,7 +137,9 @@ function handleDirectFileResolved(url, width, height, duration, sizeBytes, succe
     label,
     videoUrl: url,
     audioUrl: "",
-    resolution: width > 0 && height > 0 ? `${width}x${height}` : ""
+    resolution: width > 0 && height > 0 ? `${width}x${height}` : "",
+    size: formatSizeStr(sizeBytes) || null,
+    duration: formatDurationStr(duration) || null
   }];
 
   resolvedDirectFiles.set(url, {
@@ -231,17 +233,18 @@ function handleManifestParsed(url, formats, success) {
           if (success && formats && formats.length > 0) {
             // Enrich HLS/DASH formats lacking resolution metadata using target element DOM width/height
             target.formats = formats.map(f => {
+              let updated = { ...f };
               if ((!f.resolution || f.resolution === "0x0" || f.label.includes("Direct")) && target.videoWidth > 0 && target.videoHeight > 0) {
                 const bitrateKbps = extractBitrateFromLabel(f.label);
                 const enrichedLabel = makeJSLabel(mediaTypeFromFormatLabel(f.label) || "HLS", target.videoWidth, target.videoHeight, target.duration || 0, bitrateKbps, 0);
                 console.log(`[Background] Enriched naked manifest label with DOM resolution: ${target.videoWidth}x${target.videoHeight}`);
-                return {
-                  ...f,
-                  label: enrichedLabel,
-                  resolution: `${target.videoWidth}x${target.videoHeight}`
-                };
+                updated.label = enrichedLabel;
+                updated.resolution = `${target.videoWidth}x${target.videoHeight}`;
               }
-              return f;
+              if (!updated.duration && target.duration > 0) {
+                updated.duration = formatDurationStr(target.duration) || null;
+              }
+              return updated;
             });
             target.status = "ready";
             console.log(`[Background] Manifest parsed successfully for url=${url}, setting status=ready`);
@@ -636,20 +639,40 @@ function isFontAsset(url, contentType = "") {
   return false;
 }
 
+const IDM_CONTENT_TYPE_MAP = {
+  'video/mp4': ["MP4", "M4V", "M4S"],
+  'video/x-mp4': ["MP4", "M4V", "M4S"],
+  'video/mpg4': ["MP4", "M4V", "M4S"],
+  'video/mp2t': ["TS", "TSV", "M3U8"],
+  'audio/mp2t': ["TS", "TSV", "M3U8"],
+  'application/vnd.apple.mpegurl': ["M3U8"],
+  'application/x-mpegurl': ["M3U8"],
+  'application/octet-stream-m3u8': ["M3U8"],
+  'application/dash+xml': ["MPD"],
+  'video/vnd.mpeg.dash.mpd': ["MPD"],
+  'video/webm': ["WEBM"],
+  'audio/webm': ["WEBM"]
+};
+
+const GLOBAL_MEDIA_EXTENSIONS = new Set([
+  "mp4", "m4v", "m4s", "ts", "tsv", "m3u8", "mpd", "webm", "mkv", "flv", "m4a", "mp3", "aac", "ogg", "avi", "mov", "wmv", "3gp"
+]);
+
 function isWhitelistedMedia(url, contentType = "") {
   if (isFontAsset(url, contentType)) return false;
 
   const urlLower = String(url || "").toLowerCase();
   const ext = TurDownloadClassifier.extensionFromUrl(urlLower).toLowerCase();
-  const WHITELISTED_EXTENSIONS = new Set([
-    "m3u8", "mpd", "mp4", "mkv", "webm", "flv", "ts", "m4s", "m4v", "m4a", "mp3", "aac", "ogg", "avi", "mov", "wmv", "3gp"
-  ]);
 
-  if (WHITELISTED_EXTENSIONS.has(ext)) {
+  if (GLOBAL_MEDIA_EXTENSIONS.has(ext)) {
     return true;
   }
 
-  const typeLower = String(contentType || "").toLowerCase();
+  const typeLower = String(contentType || "").toLowerCase().split(";", 1)[0].trim();
+  if (IDM_CONTENT_TYPE_MAP[typeLower]) {
+    return true;
+  }
+
   if (
     typeLower.startsWith("video/") ||
     typeLower.startsWith("audio/") ||
@@ -694,6 +717,9 @@ try {
 
 const headersReceivedHandler = function(details) {
   if (details.tabId < 0) return;
+  // Hardening 2: High-Performance Header Filtering Early Exit
+  if (!["media", "xmlhttprequest", "other"].includes(details.type)) return;
+
   const headers = details.responseHeaders || [];
   const rawContentType = findHeader(headers, "content-type");
   const contentType = rawContentType.toLowerCase().split(";", 1)[0].trim();
@@ -701,45 +727,102 @@ const headersReceivedHandler = function(details) {
   
   if (!isWhitelistedMedia(details.url, contentType)) return;
 
+  // Extract filename tokens from headers using matching 'filename="([^"]+)"' or 'name="([^"]+)"'
+  let headerFilename = "";
+  for (const h of headers) {
+    const nameLower = h.name.toLowerCase();
+    if (nameLower === "content-disposition" || nameLower === "content-type") {
+      const val = h.value || "";
+      const fnMatch = /filename="([^"]+)"/i.exec(val);
+      if (fnMatch) {
+        headerFilename = fnMatch[1];
+        break;
+      }
+      const nameMatch = /name="([^"]+)"/i.exec(val);
+      if (nameMatch) {
+        headerFilename = nameMatch[1];
+        break;
+      }
+    }
+  }
+
+  let overrideExtension = "";
+  if (headerFilename) {
+    const parts = headerFilename.split(".");
+    if (parts.length > 1) {
+      const extCandidate = parts.pop().trim().toLowerCase();
+      if (GLOBAL_MEDIA_EXTENSIONS.has(extCandidate)) {
+        overrideExtension = extCandidate;
+      }
+    }
+  }
+
   const isTargetMime = [
     "application/vnd.apple.mpegurl",
     "application/x-mpegurl",
     "application/dash+xml",
-    "video/mp2t"
+    "video/mp2t",
+    "audio/mp2t",
+    "application/octet-stream-m3u8",
+    "video/vnd.mpeg.dash.mpd"
   ].includes(contentType);
 
   const classified = TurDownloadClassifier.classifyDownload(details.url, rawContentType, disposition);
   
-  if (isTargetMime || classified.downloadable || classified.playable || classified.attachment) {
+  if (isTargetMime || overrideExtension || classified.downloadable || classified.playable || classified.attachment) {
     let mediaType = classified.mediaType;
     let category = classified.category;
-    
-    if (isTargetMime) {
-      if (contentType.includes("mpegurl")) {
+    let extension = classified.extension;
+    let filename = classified.filename || headerFilename;
+
+    if (overrideExtension) {
+      mediaType = overrideExtension;
+      category = ["m3u8", "mpd"].includes(overrideExtension) ? "stream" : 
+                 (["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"].includes(overrideExtension) ? "audio" : "video");
+      extension = overrideExtension;
+    } else if (isTargetMime) {
+      if (contentType.includes("mpegurl") || contentType.includes("m3u8")) {
         mediaType = "hls";
         category = "stream";
+        extension = "m3u8";
       } else if (contentType.includes("dash")) {
         mediaType = "dash";
         category = "stream";
-      } else if (contentType === "video/mp2t") {
+        extension = "mpd";
+      } else if (contentType === "video/mp2t" || contentType === "audio/mp2t") {
         mediaType = "ts";
-        category = "video";
+        category = contentType === "audio/mp2t" ? "audio" : "video";
+        extension = "ts";
       }
     }
 
-    console.log(`[Background] Intercepted target MIME / media headersReceived: url=${details.url}, contentType=${contentType}, tabId=${details.tabId}`);
+    // Ingest complete IDM content-type taxonomy mappings if matching
+    if (IDM_CONTENT_TYPE_MAP[contentType] && !overrideExtension) {
+      const mappedExtensions = IDM_CONTENT_TYPE_MAP[contentType];
+      const primaryExt = mappedExtensions[0].toLowerCase();
+      mediaType = primaryExt;
+      category = ["m3u8", "mpd"].includes(primaryExt) ? "stream" : 
+                 (["mp3", "m4a", "aac", "ogg", "opus", "wav", "flac"].includes(primaryExt) ? "audio" : "video");
+      extension = primaryExt;
+    }
+
+    const rawContentLength = findHeader(headers, "content-length");
+    const sizeBytes = rawContentLength ? parseInt(rawContentLength, 10) : 0;
+
+    console.log(`[Background] Intercepted target MIME / media headersReceived: url=${details.url}, contentType=${contentType}, overrideExtension=${overrideExtension}, tabId=${details.tabId}`);
     
     const item = {
       url: details.url,
       mediaType: mediaType || "direct",
       category: category || "unknown",
-      extension: classified.extension || (mediaType === "ts" ? "ts" : ""),
-      filename: classified.filename || "",
+      extension: extension || (mediaType === "ts" ? "ts" : ""),
+      filename: filename || "",
       playable: true,
       attachment: classified.attachment || false,
       pageUrl: details.initiator || details.documentUrl || "",
       source: "webRequest",
-      mimeType: contentType
+      mimeType: contentType,
+      sizeBytes: sizeBytes || null
     };
 
     rememberTabMedia(details.tabId, item);
@@ -1122,16 +1205,17 @@ async function handleTargetsUpdate(tabId, tab, payload) {
       if (cached) {
         status = "ready";
         formats = cached.map(f => {
+          let updated = { ...f };
           if ((!f.resolution || f.resolution === "0x0" || f.label.includes("Direct")) && t.videoWidth > 0 && t.videoHeight > 0) {
             const bitrateKbps = extractBitrateFromLabel(f.label);
             const enrichedLabel = makeJSLabel(mediaTypeFromFormatLabel(f.label) || "HLS", t.videoWidth, t.videoHeight, t.duration || 0, bitrateKbps, 0);
-            return {
-              ...f,
-              label: enrichedLabel,
-              resolution: `${t.videoWidth}x${t.videoHeight}`
-            };
+            updated.label = enrichedLabel;
+            updated.resolution = `${t.videoWidth}x${t.videoHeight}`;
           }
-          return f;
+          if (!updated.duration && t.duration > 0) {
+            updated.duration = formatDurationStr(t.duration) || null;
+          }
+          return updated;
         });
         console.log(`[Background] Target ${t.elementId} HLS/DASH/TS cache HIT: url=${targetUrl}`);
       } else {
@@ -1169,7 +1253,9 @@ async function handleTargetsUpdate(tabId, tab, payload) {
         label: makeJSLabel(ext, t.videoWidth || 0, t.videoHeight || 0, t.duration || 0, 0, 0),
         videoUrl: targetUrl,
         audioUrl: "",
-        resolution: t.videoWidth > 0 && t.videoHeight > 0 ? `${t.videoWidth}x${t.videoHeight}` : ""
+        resolution: t.videoWidth > 0 && t.videoHeight > 0 ? `${t.videoWidth}x${t.videoHeight}` : "",
+        size: null,
+        duration: formatDurationStr(t.duration) || null
       }];
     }
 
@@ -1517,13 +1603,20 @@ function canonicalStreamUrl(url) {
     });
 
     let path = u.pathname;
-    path = path.replace(/\b\d+\b/g, "*");
-    path = path.replace(/[-_]\d+(?=\b|\.[a-z0-9]+)/ig, "-*");
+    // Aggressive digit sequence pattern normalization to collapse rolling chunks
+    path = path.replace(/\d+/g, "*");
     u.pathname = path;
     return u.href;
   } catch (_) {
     return url.replace(/\d+/g, "*");
   }
+}
+
+function computeTrackHash(item) {
+  const basePath = canonicalStreamUrl(item.url);
+  const contentType = item.mimeType || "";
+  const resolution = (item.width && item.height) ? `${item.width}x${item.height}` : "";
+  return `${basePath}|${contentType}|${resolution}`;
 }
 
 function rememberTabMedia(tabId, item, persist = true) {
@@ -1532,35 +1625,30 @@ function rememberTabMedia(tabId, item, persist = true) {
   const normalized = normalizeMediaItem(item);
   const current = tabMedia.get(tabId) || [];
 
-  // Collapse rolling fragmented chunks (TS and M4S)
+  const trackHash = computeTrackHash(normalized);
+  normalized.trackHash = trackHash;
+
   const isFragment = ["ts", "m4s"].includes(normalized.extension.toLowerCase()) || 
                      normalized.mimeType === "video/mp2t" || 
-                     normalized.mediaType === "ts";
+                     normalized.mediaType === "ts" ||
+                     normalized.mediaType === "m4s";
 
-  let existingIndex = -1;
-  if (isFragment) {
-    const canonicalNew = canonicalStreamUrl(normalized.url);
-    existingIndex = current.findIndex((entry) => {
-      const isEntryFragment = ["ts", "m4s"].includes(entry.extension.toLowerCase()) || 
-                              entry.mimeType === "video/mp2t" || 
-                              entry.mediaType === "ts";
-      // Track Identity Isolate: must match mediaType (e.g. video vs audio) to avoid merging them
-      return isEntryFragment && 
-             entry.mediaType === normalized.mediaType && 
-             canonicalStreamUrl(entry.url) === canonicalNew;
-    });
-  } else {
-    existingIndex = current.findIndex((entry) => entry.url === normalized.url);
-  }
+  const existingIndex = current.findIndex((entry) => entry.trackHash === trackHash);
 
   if (existingIndex >= 0) {
+    const existing = current[existingIndex];
+    // Accumulate total size for repeated segments (Hardening 1)
+    let newSizeBytes = (existing.sizeBytes || 0) + (normalized.sizeBytes || 0);
+
     current[existingIndex] = {
-      ...current[existingIndex],
+      ...existing,
       ...normalized,
+      sizeBytes: newSizeBytes || null,
       // Track Identity Isolate: Keep the original chunk URL for downloading
-      url: isFragment ? current[existingIndex].url : normalized.url,
-      playable: current[existingIndex].playable || normalized.playable,
-      label: normalized.label || current[existingIndex].label || "",
+      url: isFragment ? existing.url : normalized.url,
+      playable: existing.playable || normalized.playable,
+      label: normalized.label || existing.label || "",
+      trackHash: trackHash
     };
   } else {
     current.push(normalized);
@@ -1587,6 +1675,8 @@ function normalizeMediaItem(item) {
     width: item.width || null,
     height: item.height || null,
     duration: item.duration || null,
+    sizeBytes: item.sizeBytes || null,
+    mimeType: item.mimeType || item.mime_type || ""
   };
 }
 
@@ -1682,7 +1772,7 @@ function resolveUrl(base, relative) {
 }
 
 // Unified Option String Formatting Engine
-// Schema: "[TYPE] | WidthxHeight | Xmin Ysec | Bitratekbps | ~SizeMB"
+// Schema: "[TYPE] | WidthxHeight | Xmin Ysec | Bitratekbps | SizeMB"
 function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) {
   const typeStr = (type || "VIDEO").toUpperCase();
   const parts = [typeStr];
@@ -1694,20 +1784,8 @@ function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) 
   }
 
   if (durationSecs > 0) {
-    const totalSecs = Math.round(durationSecs);
-    if (totalSecs > 0) {
-      if (totalSecs < 60) {
-        parts.push(`${totalSecs}sec`);
-      } else if (totalSecs < 3600) {
-        const mins = Math.floor(totalSecs / 60);
-        const secs = totalSecs % 60;
-        parts.push(`${mins}min ${secs}sec`);
-      } else {
-        const hours = Math.floor(totalSecs / 3600);
-        const mins = Math.floor((totalSecs % 3600) / 60);
-        parts.push(`${hours}hr ${mins}min`);
-      }
-    }
+    const durStr = formatDurationStr(durationSecs);
+    if (durStr) parts.push(durStr);
   }
 
   if (bitrateKbps > 0) {
@@ -1720,18 +1798,43 @@ function makeJSLabel(type, width, height, durationSecs, bitrateKbps, sizeBytes) 
   }
 
   if (computedSize > 0) {
-    if (computedSize < 1024 * 1024) {
-      parts.push(`${Math.round(computedSize / 1024)}KB`);
-    } else if (computedSize < 1024 * 1024 * 1024) {
-      const mb = computedSize / (1024 * 1024);
-      parts.push(`${mb % 1 === 0 ? mb : mb.toFixed(1)}MB`);
-    } else {
-      const gb = computedSize / (1024 * 1024 * 1024);
-      parts.push(`${gb.toFixed(2)}GB`);
-    }
+    const szStr = formatSizeStr(computedSize);
+    if (szStr) parts.push(szStr);
   }
 
   return parts.join(" | ");
+}
+
+function formatDurationStr(durationSecs) {
+  if (!(durationSecs > 0)) return null;
+  const totalSecs = Math.round(durationSecs);
+  if (totalSecs < 60) {
+    return `${totalSecs}sec`;
+  } else if (totalSecs < 3600) {
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
+    return `${mins}min ${secs}sec`;
+  } else {
+    const hours = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    return `${hours}hr ${mins}min`;
+  }
+}
+
+function formatSizeStr(sizeBytes) {
+  if (!(sizeBytes > 0)) return null;
+  if (sizeBytes < 1024) {
+    return `${Math.round(sizeBytes)} B`;
+  } else if (sizeBytes < 1024 * 1024) {
+    const kb = sizeBytes / 1024;
+    return `${kb % 1 === 0 ? kb : kb.toFixed(1)}KB`;
+  } else if (sizeBytes < 1024 * 1024 * 1024) {
+    const mb = sizeBytes / (1024 * 1024);
+    return `${mb % 1 === 0 ? mb : mb.toFixed(1)}MB`;
+  } else {
+    const gb = sizeBytes / (1024 * 1024 * 1024);
+    return `${gb.toFixed(2)}GB`;
+  }
 }
 
 function extractBitrateFromLabel(label) {

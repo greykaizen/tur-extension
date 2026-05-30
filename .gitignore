@@ -27,3 +27,4 @@ Thumbs.db
 # Build outputs
 /extension/dist/
 /tasks
+/idm
