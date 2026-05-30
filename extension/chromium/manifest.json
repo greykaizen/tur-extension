@@ -31,14 +31,16 @@
       "matches": ["<all_urls>"],
       "js": ["scripts/classifier.js", "scripts/content.js"],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true
     },
     {
       "matches": ["<all_urls>"],
       "js": ["scripts/inject.js"],
       "run_at": "document_start",
       "world": "MAIN",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "icons": {

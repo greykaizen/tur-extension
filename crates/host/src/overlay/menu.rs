@@ -2,7 +2,7 @@
 
 use std::ptr::null_mut;
 use std::sync::{Mutex, OnceLock};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PCSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -68,6 +68,55 @@ pub fn cancel_pending_menu() {
         *lock = None;
     }
 }
+pub unsafe fn apply_menu_dark_mode(hwnd: HWND, enable: bool) {
+    let uxtheme_name: Vec<u16> = "uxtheme.dll".encode_utf16().chain(std::iter::once(0)).collect();
+    if let Ok(hmodule) = windows::Win32::System::LibraryLoader::LoadLibraryW(PCWSTR(uxtheme_name.as_ptr())) {
+        // SetPreferredAppMode (Ordinal 135)
+        if let Some(set_preferred_app_mode) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            hmodule,
+            PCSTR(135 as *const u8),
+        ) {
+            let set_preferred_app_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_preferred_app_mode);
+            let mode = if enable { 2 } else { 3 }; // 2 is ForceDark, 3 is ForceLight
+            set_preferred_app_mode(mode);
+        }
+
+        // FlushMenuThemes (Ordinal 136)
+        if let Some(flush_menu_themes) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            hmodule,
+            PCSTR(136 as *const u8),
+        ) {
+            let flush_menu_themes: extern "system" fn() = std::mem::transmute(flush_menu_themes);
+            flush_menu_themes();
+        }
+
+        // SetWindowTheme (from uxtheme.dll)
+        if let Some(set_window_theme) = windows::Win32::System::LibraryLoader::GetProcAddress(
+            hmodule,
+            PCSTR("SetWindowTheme\0".as_ptr()),
+        ) {
+            let set_window_theme: extern "system" fn(HWND, PCWSTR, PCWSTR) -> windows::core::HRESULT = std::mem::transmute(set_window_theme);
+            if enable {
+                let explorer: Vec<u16> = "Explorer\0".encode_utf16().collect();
+                let _ = set_window_theme(hwnd, PCWSTR(explorer.as_ptr()), PCWSTR(std::ptr::null()));
+            } else {
+                let _ = set_window_theme(hwnd, PCWSTR(std::ptr::null()), PCWSTR(std::ptr::null()));
+            }
+
+            // Also execute on the parent controller HWND to flush non-client borders
+            let controller_val = crate::CONTROLLER_HWND.load(std::sync::atomic::Ordering::Acquire);
+            if controller_val != 0 {
+                let controller_hwnd = HWND(controller_val as *mut std::ffi::c_void);
+                if enable {
+                    let explorer: Vec<u16> = "Explorer\0".encode_utf16().collect();
+                    let _ = set_window_theme(controller_hwnd, PCWSTR(explorer.as_ptr()), PCWSTR(std::ptr::null()));
+                } else {
+                    let _ = set_window_theme(controller_hwnd, PCWSTR(std::ptr::null()), PCWSTR(std::ptr::null()));
+                }
+            }
+        }
+    }
+}
 
 /// quality popup menu (anchored to button bottom-left)
 pub unsafe fn show_quality_menu(
@@ -77,8 +126,8 @@ pub unsafe fn show_quality_menu(
     tab_id: i32,
     media_url: &str,
 ) {
-    // Lock canvas state briefly to copy the status, formats, cookie, referer, user_agent
-    let (status, formats, cookie, referer, user_agent) = {
+    // Lock canvas state briefly to copy the status, formats, cookie, referer, user_agent, is_dark
+    let (status, formats, cookie, referer, user_agent, is_dark) = {
         let lock = crate::overlay::canvas().lock().unwrap();
         if let Some(ref state) = *lock {
             if let Some(target) = state.targets.iter().find(|t| t.element_id == element_id) {
@@ -88,6 +137,7 @@ pub unsafe fn show_quality_menu(
                     target.cookie.clone(),
                     state.referer.clone(),
                     state.user_agent.clone(),
+                    state.is_dark,
                 )
             } else {
                 return; // target not found
@@ -128,13 +178,17 @@ pub unsafe fn show_quality_menu(
         Err(_) => return,
     };
 
+    // Apply dark mode theme if enabled
+    apply_menu_dark_mode(hwnd, is_dark);
+
     // Dynamic profile listing
     if formats.is_empty() {
         let label = wstr!("Download (Default Quality)");
         let _ = AppendMenuW(menu, MF_STRING, 10000, PCWSTR(label.as_ptr()));
     } else {
         for (idx, f) in formats.iter().enumerate() {
-            let label = wstr!(&f.label);
+            let label_str = format!("{}. {}", idx + 1, f.label);
+            let label = wstr!(&label_str);
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,

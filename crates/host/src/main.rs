@@ -238,7 +238,7 @@ fn write_response(value: &serde_json::Value) {
 }
 
 #[cfg(target_os = "windows")]
-static CONTROLLER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub static CONTROLLER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 // ── main thread: controller window + message pump ────────────────────────
 

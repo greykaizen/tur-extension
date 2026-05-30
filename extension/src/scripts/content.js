@@ -43,7 +43,39 @@ window.addEventListener(MEDIA_EVENT, (event) => {
   rememberMedia(detail.url, detail.mediaType, detail.pageUrl, detail.category, detail.source || "main-world");
 });
 
+let subframeTargets = [];
+
 window.addEventListener("message", (event) => {
+  // 1. Handle cross-origin subframe targets message
+  if (event.data && event.data.type === "TUR_SUBFRAME_TARGETS") {
+    const iframes = findMediaElements().filter(el => el.localName === "iframe");
+    let sourceIframe = null;
+    for (const iframe of iframes) {
+      if (iframe.contentWindow === event.source) {
+        sourceIframe = iframe;
+        break;
+      }
+    }
+    
+    if (sourceIframe) {
+      let entry = subframeTargets.find(e => e.iframe === sourceIframe);
+      if (!entry) {
+        entry = { iframe: sourceIframe };
+        subframeTargets.push(entry);
+      }
+      entry.rawTargets = event.data.targets || [];
+      
+      if (event.data.media && event.data.media.length > 0) {
+        for (const m of event.data.media) {
+          rememberMedia(m.url, m.mediaType, m.pageUrl, m.category, m.source || "subframe");
+        }
+      }
+      scheduleTargetReport();
+    }
+    return;
+  }
+
+  // 2. Handle main-world interceptor messages
   if (event.source !== window) return;
   if (event.data?.source !== "TUR_INTERCEPTOR") return;
   const payload = event.data?.payload || {};
@@ -147,24 +179,63 @@ function refreshMediaElements() {
 function processMediaElement(element) {
   if (!(element instanceof Element)) return;
   const tag = element.localName;
-  if (!["video", "audio", "object", "embed"].includes(tag)) return;
+  if (!["video", "audio", "object", "embed", "iframe"].includes(tag)) return;
   if (observedElements.has(element)) return;
 
   observedElements.add(element);
   intersectionObserver.observe(element);
   resizeObserver.observe(element);
 
-  element.addEventListener("loadedmetadata", () => {
-    rememberElementSource(element, "metadata");
-    scheduleTargetReport();
-  }, true);
-  element.addEventListener("play", scheduleTargetReport, true);
-  element.addEventListener("pause", scheduleTargetReport, true);
-  element.addEventListener("playing", scheduleTargetReport, true);
-  element.addEventListener("durationchange", scheduleTargetReport, true);
-  element.addEventListener("emptied", scheduleTargetReport, true);
+  if (tag !== "iframe") {
+    element.addEventListener("loadedmetadata", () => {
+      rememberElementSource(element, "metadata");
+      scheduleTargetReport();
+    }, true);
+    element.addEventListener("play", scheduleTargetReport, true);
+    element.addEventListener("pause", scheduleTargetReport, true);
+    element.addEventListener("playing", scheduleTargetReport, true);
+    element.addEventListener("durationchange", scheduleTargetReport, true);
+    element.addEventListener("emptied", scheduleTargetReport, true);
+  }
 
-  rememberElementSource(element, "dom");
+  // Active MutationObserver directly on the element (iframe or video player node)
+  try {
+    const observer = new MutationObserver((mutations) => {
+      let sourceChanged = false;
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes") {
+          if (["src", "data-src", "data", "currentSrc"].includes(mutation.attributeName)) {
+            sourceChanged = true;
+          }
+        } else if (mutation.type === "childList") {
+          for (const added of mutation.addedNodes) {
+            if (added.localName === "source") sourceChanged = true;
+          }
+        }
+      }
+      if (sourceChanged) {
+        console.log(`[Content] Lazy source mutation detected on <${tag}>:`, element);
+        if (tag !== "iframe") {
+          rememberElementSource(element, "mutation");
+        }
+        // Instantly trigger collectAllTargets, flush the old target states, and dispatch
+        lastTargetSignature = "";
+        reportTargets();
+      }
+    });
+    observer.observe(element, {
+      attributes: true,
+      attributeFilter: ["src", "data-src", "data", "currentSrc"],
+      childList: true,
+      subtree: true
+    });
+  } catch (e) {
+    console.debug("[tur] element observer failed to bind", e);
+  }
+
+  if (tag !== "iframe") {
+    rememberElementSource(element, "dom");
+  }
 }
 
 function rememberElementSource(element, source) {
@@ -209,9 +280,40 @@ function scheduleTargetReport() {
 }
 
 function reportTargets() {
-  const targets = collectAllTargets();
+  let targets = collectAllTargets();
   const media = sortedCandidates();
   const viewport = currentViewportGeometry();
+
+  // Clean up and translate subframe targets
+  subframeTargets = subframeTargets.filter(e => e.iframe.isConnected);
+
+  for (const entry of subframeTargets) {
+    // Perform getBoundingClientRect once per frame inside requestAnimationFrame to protect performance
+    const iframeRect = entry.iframe.getBoundingClientRect();
+    const translated = (entry.rawTargets || []).map(t => {
+      return {
+        ...t,
+        clientX: Math.round(iframeRect.left + t.clientX),
+        clientY: Math.round(iframeRect.top + t.clientY),
+        elementId: `iframe_${entry.iframe.dataset.turId || ensureElementId(entry.iframe)}_${t.elementId}`,
+        cookie: t.cookie || "",
+        referer: t.referer || "",
+      };
+    });
+    targets = targets.concat(translated);
+  }
+
+  if (window !== window.top) {
+    // intermediate subframes bubble targets up to window.parent, throttled by requestAnimationFrame
+    window.parent.postMessage({
+      type: "TUR_SUBFRAME_TARGETS",
+      targets: targets,
+      media: media,
+      cookie: document.cookie || "",
+      frameUrl: window.location.href
+    }, "*");
+    return;
+  }
 
   const payload = {
     type: "MEDIA_TARGETS_UPDATE",
@@ -220,7 +322,7 @@ function reportTargets() {
     referer: window.location.href,
     userAgent: navigator.userAgent,
     media,
-    isTopFrame: window === window.top,
+    isTopFrame: true,
     viewportScreenX: viewport.screenX,
     viewportScreenY: viewport.screenY,
     viewportWidth: viewport.width,
@@ -268,7 +370,13 @@ function collectAllTargets() {
     if (!rect) continue;
 
     const tag = element.localName;
-    if (tag === "iframe" && !isLikelyVideoIframe(element)) continue;
+    if (tag === "iframe") {
+      const hasSubframeTargets = subframeTargets.some(e => e.iframe === element && e.rawTargets && e.rawTargets.length > 0);
+      if (hasSubframeTargets) {
+        continue;
+      }
+      if (!isLikelyVideoIframe(element)) continue;
+    }
 
     const minimumWidth = tag === "audio" ? 1 : 96;
     const minimumHeight = tag === "audio" ? 1 : 54;
@@ -292,6 +400,7 @@ function collectAllTargets() {
       status: "pending",
       formats: [],
       cookie: document.cookie || "",
+      referer: window.location.href,
       duration: (element.duration && !isNaN(element.duration)) ? element.duration : 0,
       videoWidth: element.videoWidth || 0,
       videoHeight: element.videoHeight || 0,
@@ -321,7 +430,7 @@ function findMediaElements(root = document) {
       if (["video", "audio", "object", "embed"].includes(tag)) {
         list.push(node);
       }
-      if (tag === "iframe" && window === window.top) {
+      if (tag === "iframe") {
         list.push(node);
       }
       if (node.shadowRoot) {
