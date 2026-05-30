@@ -1,6 +1,6 @@
 // Detector-only content script.
 //
-// This script intentionally renders no UI. IDM-style browser overlays must be
+// This script intentionally renders no UI. HUD-style browser overlays must be
 // native/browser-owned surfaces, not DOM injected into arbitrary websites.
 
 "use strict";

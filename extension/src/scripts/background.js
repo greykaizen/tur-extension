@@ -639,7 +639,7 @@ function isFontAsset(url, contentType = "") {
   return false;
 }
 
-const IDM_CONTENT_TYPE_MAP = {
+const TUR_CONTENT_TYPE_MAP = {
   'video/mp4': ["MP4", "M4V", "M4S"],
   'video/x-mp4': ["MP4", "M4V", "M4S"],
   'video/mpg4': ["MP4", "M4V", "M4S"],
@@ -669,7 +669,7 @@ function isWhitelistedMedia(url, contentType = "") {
   }
 
   const typeLower = String(contentType || "").toLowerCase().split(";", 1)[0].trim();
-  if (IDM_CONTENT_TYPE_MAP[typeLower]) {
+  if (TUR_CONTENT_TYPE_MAP[typeLower]) {
     return true;
   }
 
@@ -796,9 +796,9 @@ const headersReceivedHandler = function(details) {
       }
     }
 
-    // Ingest complete IDM content-type taxonomy mappings if matching
-    if (IDM_CONTENT_TYPE_MAP[contentType] && !overrideExtension) {
-      const mappedExtensions = IDM_CONTENT_TYPE_MAP[contentType];
+    // Ingest complete content-type taxonomy mappings if matching
+    if (TUR_CONTENT_TYPE_MAP[contentType] && !overrideExtension) {
+      const mappedExtensions = TUR_CONTENT_TYPE_MAP[contentType];
       const primaryExt = mappedExtensions[0].toLowerCase();
       mediaType = primaryExt;
       category = ["m3u8", "mpd"].includes(primaryExt) ? "stream" : 
