@@ -185,6 +185,7 @@ unsafe fn do_update(u: CanvasUpdate) {
     let dpi = (u.device_pixel_ratio * 96.0) as f32;
 
     let mut need_init = false;
+    let mut dpr_changed = false;
 
     {
         let mut g = canvas().lock().unwrap();
@@ -213,13 +214,17 @@ unsafe fn do_update(u: CanvasUpdate) {
             });
             need_init = true;
         } else if let Some(ref mut state) = *g {
+            // Capture DPR delta BEFORE updating, so the resize check
+            // below can detect cross-monitor moves even when physical
+            // viewport size is identical.
+            dpr_changed = state.dpr != u.device_pixel_ratio;
+            state.dpr = u.device_pixel_ratio;
             state.hwnd = new_hwnd.0 as isize;
             state.tab_id = u.tab_id;
             state.viewport_screen_x = u.viewport_screen_x;
             state.viewport_screen_y = u.viewport_screen_y;
             state.viewport_width = u.viewport_width;
             state.viewport_height = u.viewport_height;
-            state.dpr = u.device_pixel_ratio;
             state.targets = u.targets.clone();
             state.is_dark = u.is_dark;
             state.referer = u.referer.clone();
@@ -244,11 +249,13 @@ unsafe fn do_update(u: CanvasUpdate) {
             }
         }
     } else {
-        // Resize swapchain if dimensions changed.
+        // Resize swapchain if dimensions or DPR changed.
+        // dpr_changed was captured above BEFORE state.dpr was updated,
+        // so it correctly reflects a real DPI transition.
         let mut lock = canvas().lock().unwrap();
         if let Some(ref mut state) = *lock {
             if let Some(ref mut g) = state.gpu {
-                if g.sc_size != (phys_w, phys_h) {
+                if g.sc_size != (phys_w, phys_h) || dpr_changed {
                     if let Err(e) = gpu::resize_swapchain(g, phys_w, phys_h, dpi) {
                         eprintln!("[tur] overlay: swapchain resize failed: {e:?}");
                     }
