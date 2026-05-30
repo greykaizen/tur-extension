@@ -25,12 +25,6 @@ pub const FONT_SIZE: f32 = 10.0; // font size in pt
 // Logo drag zone: anything left of PILL_START_X is the drag handle
 pub const PILL_START_X: f32 = LOGO_L + LOGO_SZ + PILL_GAP_L; // = 23.0 DIPs
 
-// Quality popup menu command IDs
-pub const MENU_DL_1080P: usize = 1001;
-pub const MENU_DL_720P: usize = 1002;
-pub const MENU_DL_480P: usize = 1003;
-pub const MENU_COPY_URL: usize = 1004;
-
 
 
 // ── HitZone enum ─────────────────────────────────────────────────────────────
@@ -78,6 +72,8 @@ pub struct CanvasState {
     pub targets: Vec<TargetInfo>,
     pub is_dark: bool,
     pub gpu: Option<GpuState>,
+    pub referer: String,
+    pub user_agent: String,
     // ── drag state ──────────────────────────────────────────────────────────
     pub potential_drag: bool,
     pub potential_zone: HitZone,

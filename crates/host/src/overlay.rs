@@ -11,13 +11,13 @@ use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Submodules according to modern Rust layout guidelines (no mod.rs)
 pub mod types;
 pub mod gpu;
 pub mod wic;
 pub mod menu;
 pub mod wndproc;
 pub mod render;
+pub mod ytdlp;
 
 // Re-export common public types
 pub use types::{CanvasUpdate, TargetInfo};
@@ -200,6 +200,8 @@ unsafe fn do_update(u: CanvasUpdate) {
                 targets: u.targets.clone(),
                 is_dark: u.is_dark,
                 gpu: None,
+                referer: u.referer.clone(),
+                user_agent: u.user_agent.clone(),
                 potential_drag: false,
                 potential_zone: HitZone::None,
                 dragging: false,
@@ -220,6 +222,8 @@ unsafe fn do_update(u: CanvasUpdate) {
             state.dpr = u.device_pixel_ratio;
             state.targets = u.targets.clone();
             state.is_dark = u.is_dark;
+            state.referer = u.referer.clone();
+            state.user_agent = u.user_agent.clone();
             if state.gpu.is_none() {
                 need_init = true;
             }

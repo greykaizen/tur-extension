@@ -102,7 +102,7 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
             continue;
         };
 
-        let msg_type = msg["type"].as_str().unwrap_or("");
+        let msg_type = msg["type"].as_str().or(msg["action"].as_str()).unwrap_or("");
         match msg_type {
             "MEDIA_TARGETS_UPDATE" => {
                 let result = parse_targets_update(&msg);
@@ -122,6 +122,18 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
             }
             "MEDIA_TARGET_UPDATE" | "MEDIA_CANDIDATES" | "MEDIA_DETECTED_NETWORK" => {
                 write_response(&serde_json::json!({"ok": true}));
+            }
+            "QUEUE_DOWNLOAD" => {
+                eprintln!("[tur] RECEIVED QUEUE_DOWNLOAD message");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "[main] QUEUE_DOWNLOAD received: {}", serde_json::to_string_pretty(&msg).unwrap_or_default());
+                }
+                write_response(&serde_json::json!({"ok": true, "status": "queued"}));
             }
             other => {
                 eprintln!("[tur] unknown message type: {other}");
@@ -147,6 +159,7 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
     }
 }
 
+
 fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String> {
     let dpr = msg["devicePixelRatio"].as_f64().unwrap_or(1.0).max(1.0);
     let raw_targets = msg["targets"].as_array().ok_or("missing targets array")?;
@@ -154,18 +167,38 @@ fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String
 
     for t in raw_targets {
         let element_id = t["elementId"].as_str().unwrap_or("_unknown_").to_string();
-        let _client_x = (t["clientX"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
-        let _client_y = (t["clientY"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let client_x = (t["clientX"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
+        let client_y = (t["clientY"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
         let width = (t["width"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
         let height = (t["height"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
         let screen_x = (t["screenX"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
         let screen_y = (t["screenY"].as_f64().unwrap_or(0.0) * dpr).round() as i32;
-        let _media_url = t["mediaUrl"].as_str().unwrap_or("").to_string();
+
+        let status = match t["status"].as_str().unwrap_or("pending") {
+            "resolving" => types::TargetStatus::Resolving,
+            "ready" => types::TargetStatus::Ready,
+            _ => types::TargetStatus::Pending,
+        };
+
+        let mut formats = Vec::new();
+        if let Some(formats_arr) = t["formats"].as_array() {
+            for f in formats_arr {
+                formats.push(types::FormatInfo {
+                    label: f["label"].as_str().unwrap_or("").to_string(),
+                    video_url: f["videoUrl"].as_str().unwrap_or("").to_string(),
+                    audio_url: f["audioUrl"].as_str().unwrap_or("").to_string(),
+                    resolution: f["resolution"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+
+        let cookie = t["cookie"].as_str().unwrap_or("").to_string();
+        let duration = t["duration"].as_f64().unwrap_or(0.0);
 
         targets.push(TargetPayload {
             element_id,
-            _client_x,
-            _client_y,
+            client_x,
+            client_y,
             width,
             height,
             screen_x,
@@ -173,17 +206,23 @@ fn parse_targets_update(msg: &serde_json::Value) -> Result<TargetsUpdate, String
             media_url: t["mediaUrl"].as_str().unwrap_or("").to_string(),
             drag_offset_x: t["dragOffsetX"].as_i64().unwrap_or(0) as i32,
             drag_offset_y: t["dragOffsetY"].as_i64().unwrap_or(0) as i32,
+            duration,
+            status,
+            formats,
+            cookie,
         });
     }
 
     Ok(TargetsUpdate {
         tab_id: msg["tabId"].as_i64().unwrap_or(0) as i32,
-        _page_url: msg["pageUrl"].as_str().unwrap_or("").to_string(),
+        page_url: msg["pageUrl"].as_str().unwrap_or("").to_string(),
+        referer: msg["referer"].as_str().unwrap_or("").to_string(),
+        user_agent: msg["userAgent"].as_str().unwrap_or("").to_string(),
         viewport_screen_x: (msg["viewportScreenX"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
         viewport_screen_y: (msg["viewportScreenY"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
         viewport_width: (msg["viewportWidth"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
         viewport_height: (msg["viewportHeight"].as_f64().unwrap_or(0.0) * dpr).round() as i32,
-        _device_pixel_ratio: dpr,
+        device_pixel_ratio: dpr,
         targets,
     })
 }
@@ -283,6 +322,32 @@ unsafe extern "system" fn controller_wndproc(
             PostQuitMessage(0);
             LRESULT(0)
         }
+        overlay::ytdlp::WM_USER_TARGET_READY => {
+            let payload_ptr = lparam.0 as *mut overlay::ytdlp::YtDlpResultPayload;
+            if !payload_ptr.is_null() {
+                let payload = Box::from_raw(payload_ptr);
+                let canvas_hwnd_val = {
+                    let mut lock = overlay::canvas().lock().unwrap();
+                    if let Some(ref mut state) = *lock {
+                        if let Some(target) = state.targets.iter_mut().find(|t| t.element_id == payload.element_id) {
+                            target.formats = payload.formats;
+                            target.status = types::TargetStatus::Ready;
+                        }
+                        state.hwnd
+                    } else {
+                        0
+                    }
+                };
+                // Repaint the canvas so the button text reflects Ready state
+                if canvas_hwnd_val != 0 {
+                    let canvas_hwnd = HWND(canvas_hwnd_val as *mut std::ffi::c_void);
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(canvas_hwnd, None, false);
+                }
+                // Auto-reopen the menu if user already clicked while we were resolving
+                overlay::menu::fire_pending_menu(&payload.element_id);
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -297,16 +362,14 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         || update.viewport_width <= 0
         || update.viewport_height <= 0
     {
+        overlay::menu::cancel_pending_menu();
         overlay::hide();
         return;
     }
 
-    // Find the Chrome window that owns this viewport.
     let center_x = update.viewport_screen_x + update.viewport_width / 2;
     let center_y = update.viewport_screen_y + update.viewport_height / 2;
 
-    // Use the TOP-LEVEL browser window as owner. The DWM aggressively clips popups
-    // owned by deep child windows.
     let root = window::find_browser_root_for_point(center_x, center_y);
     let owner = root.unwrap_or(HWND(null_mut()));
 
@@ -319,23 +382,118 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         update.viewport_width,
         update.viewport_height,
         root,
-        update._device_pixel_ratio,
+        update.device_pixel_ratio,
     ));
 
-    let overlay_targets: Vec<overlay::TargetInfo> = update
-        .targets
-        .iter()
-        .map(|t| overlay::TargetInfo {
-            element_id: t.element_id.clone(),
-            screen_x:   t.screen_x,
-            screen_y:   t.screen_y,
-            width:      t.width,
-            _height:    t.height,
-            media_url:  t.media_url.clone(),
-            drag_offset_x: t.drag_offset_x,
-            drag_offset_y: t.drag_offset_y,
-        })
-        .collect();
+    let mut overlay_targets = Vec::with_capacity(update.targets.len());
+
+    for incoming in &update.targets {
+        let incoming_token = canonical_media_token(&incoming.media_url);
+
+        let existing_opt = {
+            let lock = overlay::canvas().lock().unwrap();
+            if let Some(ref state) = *lock {
+                state.targets.iter().find(|t| {
+                    t.element_id == incoming.element_id &&
+                    canonical_media_token(&t.media_url) == incoming_token
+                }).cloned()
+            } else {
+                None
+            }
+        };
+
+        log_debug(&format!(
+            "[tur] Incoming target: id={}, url={}, status={:?}, token={}, existing={}",
+            incoming.element_id,
+            incoming.media_url,
+            incoming.status,
+            incoming_token,
+            existing_opt.is_some()
+        ));
+
+        let mut final_target = overlay::TargetInfo {
+            element_id: incoming.element_id.clone(),
+            screen_x: incoming.screen_x,
+            screen_y: incoming.screen_y,
+            width: incoming.width,
+            _height: incoming.height,
+            media_url: incoming.media_url.clone(),
+            drag_offset_x: incoming.drag_offset_x,
+            drag_offset_y: incoming.drag_offset_y,
+            duration: incoming.duration,
+            status: incoming.status,
+            formats: incoming.formats.clone(),
+            cookie: incoming.cookie.clone(),
+        };
+
+        if let Some(ref existing) = existing_opt {
+            log_debug(&format!(
+                "[tur]   Target matched existing: status={:?}, formats_len={}",
+                existing.status,
+                existing.formats.len()
+            ));
+            final_target.drag_offset_x = existing.drag_offset_x;
+            final_target.drag_offset_y = existing.drag_offset_y;
+        }
+
+        // State Machine Resolution:
+        // 1. If extension says target is Ready/Resolving, trust it completely.
+        // 2. If extension says Pending:
+        //    a. If we already have a resolving or ready state in cache, preserve it.
+        //    b. Else, transition to Resolving and spin up yt-dlp worker.
+        match incoming.status {
+            types::TargetStatus::Ready | types::TargetStatus::Resolving => {
+                log_debug(&format!(
+                    "[tur]   Target {} updated by extension to status={:?}, formats={}",
+                    incoming.element_id, incoming.status, incoming.formats.len()
+                ));
+                final_target.status = incoming.status;
+                final_target.formats = incoming.formats.clone();
+            }
+            types::TargetStatus::Pending => {
+                let mut needs_resolve = true;
+                if let Some(ref existing) = existing_opt {
+                    if existing.status == types::TargetStatus::Resolving || existing.status == types::TargetStatus::Ready {
+                        log_debug(&format!(
+                            "[tur]   Preserving host-resolved status for {}: status={:?}, formats={}",
+                            incoming.element_id, existing.status, existing.formats.len()
+                        ));
+                        final_target.status = existing.status;
+                        if final_target.formats.is_empty() {
+                            final_target.formats = existing.formats.clone();
+                        }
+                        needs_resolve = false;
+                    }
+                }
+                if needs_resolve {
+                    let media_url = &incoming.media_url;
+                    let resolve_url = if media_url.starts_with("blob:")
+                        || media_url.starts_with("data:")
+                        || media_url.is_empty()
+                    {
+                        update.page_url.clone()
+                    } else {
+                        media_url.clone()
+                    };
+                    log_debug(&format!(
+                        "[tur]   Dispatching to yt-dlp fallback: element_id={} url={}",
+                        final_target.element_id, resolve_url
+                    ));
+                    final_target.status = types::TargetStatus::Resolving;
+                    overlay::ytdlp::resolve_ytdlp_async(
+                        final_target.element_id.clone(),
+                        resolve_url,
+                        incoming.cookie.clone(),
+                        update.user_agent.clone(),
+                        update.referer.clone(),
+                        _controller,
+                    );
+                }
+            }
+        }
+
+        overlay_targets.push(final_target);
+    }
 
     overlay::update(overlay::CanvasUpdate {
         tab_id: update.tab_id,
@@ -343,10 +501,12 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         viewport_screen_y: update.viewport_screen_y,
         viewport_width: update.viewport_width,
         viewport_height: update.viewport_height,
-        device_pixel_ratio: update._device_pixel_ratio,
+        device_pixel_ratio: update.device_pixel_ratio,
         targets: overlay_targets,
         owner: owner.0 as isize,
         is_dark,
+        referer: update.referer.clone(),
+        user_agent: update.user_agent.clone(),
     });
 }
 
@@ -373,10 +533,12 @@ unsafe fn handle_targets_update_macos(update: &TargetsUpdate) {
         viewport_screen_y: update.viewport_screen_y,
         viewport_width: update.viewport_width,
         viewport_height: update.viewport_height,
-        device_pixel_ratio: update._device_pixel_ratio,
+        device_pixel_ratio: update.device_pixel_ratio,
         targets: overlay_targets,
         owner: 0,
         is_dark: false,
+        referer: update.referer.clone(),
+        user_agent: update.user_agent.clone(),
     });
 }
 
@@ -417,3 +579,30 @@ fn log_debug(msg: &str) {
         let _ = writeln!(file, "{}", msg);
     }
 }
+
+fn canonical_media_token(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    if url.contains("youtube.com") || url.contains("youtu.be") {
+        if let Some(pos) = url.find("v=") {
+            let start = pos + 2;
+            let end = url[start..].find('&').map(|idx| start + idx).unwrap_or(url.len());
+            return format!("yt:{}", &url[start..end]);
+        }
+    }
+    if url.contains("vimeo.com") {
+        if let Some(pos) = url.find("vimeo.com/") {
+            let start = pos + 10;
+            let end = url[start..].find('?').map(|idx| start + idx).unwrap_or(url.len());
+            return format!("vimeo:{}", &url[start..end]);
+        }
+    }
+    if let Some(pos) = url.find('?') {
+        url[..pos].to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+

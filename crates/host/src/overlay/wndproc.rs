@@ -38,6 +38,27 @@ pub unsafe extern "system" fn canvas_wndproc(
             return LRESULT(HTCLIENT as isize);
         }
 
+        // ── Deferred menu auto-reopen ─────────────────────────────────────────
+        // Fired by fire_pending_menu() after yt-dlp finishes resolving.
+        // Handled here (canvas wndproc) so SetForegroundWindow works — the canvas
+        // window owns the mouse input context after the user's click.
+        crate::overlay::menu::WM_APP_SHOW_PENDING_MENU => {
+            let saved = {
+                let mut lock = crate::overlay::menu::pending_menu().lock().unwrap();
+                lock.take()
+            };
+            if let Some(p) = saved {
+                show_quality_menu(
+                    hwnd,
+                    POINT { x: p.pt_x, y: p.pt_y },
+                    &p.element_id,
+                    p.tab_id,
+                    &p.media_url,
+                );
+            }
+            return LRESULT(0);
+        }
+
         WM_LBUTTONDOWN => {
             let cx = (lparam.0 & 0xFFFF) as i16 as i32;
             let cy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -328,10 +349,10 @@ pub fn hud_screen_pos(state: &CanvasState, idx: usize) -> Option<(i32, i32)> {
     let (dx, dy) = effective_offset(state, idx);
 
     let bx = t.screen_x + t.width - hud_w + dx;
-    let ideal_by = t.screen_y - hud_h - hud_gap + dy;
+    let mut ideal_by = t.screen_y - hud_h - hud_gap + dy;
 
     if ideal_by < state.viewport_screen_y {
-        return None;
+        ideal_by = t.screen_y + hud_gap + dy;
     }
 
     Some((bx, ideal_by))

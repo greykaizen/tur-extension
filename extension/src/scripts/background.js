@@ -44,26 +44,241 @@ const tabTargets = new Map();
 const dynamicMenuItems = new Map();
 let menuGeneration = 0;
 let focusedBrowserWindowId = chrome.windows.WINDOW_ID_NONE;
+const resolvedManifestsCache = new Map();
+const resolvingManifests = new Set();
+
 const extensionSessionStorage = chrome.storage?.session ?? chrome.storage?.local;
 const actionApi = chrome.action ?? chrome.browserAction;
 
-async function setupOffscreenDocument() {
-  try {
-    if (typeof chrome.offscreen === "undefined") {
-      console.log("[Background] Offscreen API not supported on this browser.");
-      return;
+function getMediaType(url) {
+  if (!url) return null;
+  const path = url.toLowerCase().split('?')[0];
+  if (path.endsWith('.mpd')) return 'dash';
+  if (path.endsWith('.m3u8')) return 'hls';
+  return null;
+}
+
+function getCachedManifest(url) {
+  const cached = resolvedManifestsCache.get(url);
+  if (cached) {
+    if (Date.now() - cached.timestamp < 300000) {
+      return cached.formats;
+    } else {
+      resolvedManifestsCache.delete(url);
     }
-    const OFFSCREEN_PATH = "offscreen.html";
-    if (await chrome.offscreen.hasDocument()) return;
-    await chrome.offscreen.createDocument({
-      url: OFFSCREEN_PATH,
-      reasons: ["DOM_PARSER"],
-      justification: "Keep Native Messaging available for tur",
-    });
-    console.log("[Background] Offscreen document created.");
-  } catch (err) {
-    console.warn("[Background] Failed to set up offscreen document:", err);
   }
+  return null;
+}
+
+const resolvedDirectFiles = new Map();
+const resolvingDirectFiles = new Set();
+
+function getCachedDirectFile(url) {
+  const cached = resolvedDirectFiles.get(url);
+  if (cached) {
+    if (Date.now() - cached.timestamp < 300000) {
+      return cached.formats;
+    } else {
+      resolvedDirectFiles.delete(url);
+    }
+  }
+  return null;
+}
+
+function resolveDirectFile(tabId, url, width, height, duration) {
+  if (resolvingDirectFiles.has(url)) return;
+  resolvingDirectFiles.add(url);
+
+  console.log(`[Background] Starting HEAD request to resolve size for direct file: url=${url}`);
+  fetch(url, { method: "HEAD", credentials: "omit" })
+    .then(response => {
+      const contentLength = response.headers.get("content-length");
+      const sizeBytes = contentLength ? parseInt(contentLength, 10) : 0;
+      console.log(`[Background] HEAD request success: url=${url}, sizeBytes=${sizeBytes}`);
+      handleDirectFileResolved(url, width, height, duration, sizeBytes, true);
+    })
+    .catch(error => {
+      console.warn(`[Background] HEAD request failed: url=${url}. Error:`, error);
+      handleDirectFileResolved(url, width, height, duration, 0, false);
+    });
+}
+
+function handleDirectFileResolved(url, width, height, duration, sizeBytes, success) {
+  resolvingDirectFiles.delete(url);
+  
+  // Format the label
+  const cleanUrl = url.split(/[?#]/, 1)[0].toLowerCase();
+  const ext = isDirectMediaFile(url) ? (cleanUrl.split(".").pop().toUpperCase()) : "VIDEO";
+  const label = makeJSLabel(width, height, duration, 0, ext, sizeBytes, 0);
+  const formats = [{
+    label,
+    videoUrl: url,
+    audioUrl: "",
+    resolution: width > 0 && height > 0 ? `${width}x${height}` : ""
+  }];
+
+  resolvedDirectFiles.set(url, {
+    formats,
+    timestamp: Date.now()
+  });
+
+  // Find target in tabTargets and update
+  for (const [tId, outgoing] of tabTargets.entries()) {
+    let changed = false;
+    if (outgoing && outgoing.targets) {
+      for (const target of outgoing.targets) {
+        if (target.mediaUrl === url) {
+          target.formats = formats;
+          target.status = "ready";
+          changed = true;
+          console.log(`[Background] Hydrated target ${target.elementId} with direct file metadata: ${label}`);
+        }
+      }
+    }
+    if (changed) {
+      sendToHost(outgoing);
+    }
+  }
+}
+
+function resolveManifest(tabId, url, mediaType, duration) {
+  if (resolvingManifests.has(url)) return;
+  resolvingManifests.add(url);
+
+  if (typeof chrome.offscreen === "undefined") {
+    // Firefox fallback: fetch and parse directly in background script
+    console.log(`[Background] Firefox fallback manifest fetch: url=${url}`);
+    fetch(url, { credentials: "include" })
+      .then(response => response.text())
+      .then(text => {
+        let formats = [];
+        if (mediaType === "dash") {
+          formats = parseDASH(text, url, duration);
+        } else if (mediaType === "hls") {
+          formats = parseHLS(text, url);
+        }
+        console.log(`[Background] Firefox fallback parse success: url=${url}, formatsFound=${formats.length}`);
+        handleManifestParsed(url, formats, true);
+      })
+      .catch(error => {
+        console.error("[Background] Fetch/Parse manifest failed:", error);
+        handleManifestParsed(url, [], false);
+      });
+  } else {
+    setupOffscreenDocument().then(ready => {
+      if (ready) {
+        console.log(`[Background] Sending PARSE_MANIFEST to offscreen document: url=${url}`);
+        chrome.runtime.sendMessage({
+          type: "PARSE_MANIFEST",
+          url,
+          mediaType,
+          duration
+        });
+      } else {
+        console.warn(`[Background] Offscreen document not ready, failing manifest resolution: url=${url}`);
+        handleManifestParsed(url, [], false);
+      }
+    });
+  }
+}
+
+function handleManifestParsed(url, formats, success) {
+  resolvingManifests.delete(url);
+  if (success && formats && formats.length > 0) {
+    resolvedManifestsCache.set(url, {
+      formats,
+      timestamp: Date.now()
+    });
+  }
+  
+  for (const [tId, outgoing] of tabTargets.entries()) {
+    let changed = false;
+    if (outgoing && outgoing.targets) {
+      for (const target of outgoing.targets) {
+        if (target.mediaUrl === url) {
+          if (success && formats && formats.length > 0) {
+            // Enrich HLS/DASH formats lacking resolution metadata using target element DOM width/height
+            target.formats = formats.map(f => {
+              if ((!f.resolution || f.resolution === "0x0" || f.label.includes("Direct")) && target.videoWidth > 0 && target.videoHeight > 0) {
+                const enrichedLabel = makeJSLabel(target.videoWidth, target.videoHeight, target.duration || 0, 0, "HLS", 0, 0);
+                console.log(`[Background] Enriched naked manifest label with DOM resolution: ${target.videoWidth}x${target.videoHeight}`);
+                return {
+                  ...f,
+                  label: enrichedLabel,
+                  resolution: `${target.videoWidth}x${target.videoHeight}`
+                };
+              }
+              return f;
+            });
+            target.status = "ready";
+            console.log(`[Background] Manifest parsed successfully for url=${url}, setting status=ready`);
+          } else {
+            target.formats = [];
+            target.status = "pending"; // Fall back to host yt-dlp!
+            console.log(`[Background] Manifest parsing failed for url=${url}, setting status=pending for host fallback`);
+          }
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      sendToHost(outgoing);
+    }
+  }
+}
+
+function isWalledGarden(url) {
+  if (!url) return false;
+  const u = url.toLowerCase();
+  return u.includes("youtube.com") || u.includes("youtu.be") || u.includes("vimeo.com") || u.includes("twitch.tv");
+}
+
+// Direct media files that need yt-dlp to extract real resolution/codec/size metadata.
+// Without yt-dlp these would only get a generic "Download Stream (Default)" menu entry.
+const DIRECT_MEDIA_EXTS = new Set([
+  "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "mpeg", "mpg",
+  "ts", "m2ts", "vob", "ogv", "3gp", "3g2", "divx", "f4v", "rm", "rmvb",
+  "mp3", "m4a", "aac", "ogg", "opus", "flac", "wav", "wma", "oga",
+]);
+
+function isDirectMediaFile(url) {
+  if (!url) return false;
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    const ext = path.split(".").pop();
+    return DIRECT_MEDIA_EXTS.has(ext);
+  } catch (_) {
+    const path = url.split("?")[0].toLowerCase();
+    const ext = path.split(".").pop();
+    return DIRECT_MEDIA_EXTS.has(ext);
+  }
+}
+
+let offscreenPromise = null;
+async function setupOffscreenDocument() {
+  if (offscreenPromise) return offscreenPromise;
+  offscreenPromise = (async () => {
+    try {
+      if (typeof chrome.offscreen === "undefined") {
+        console.log("[Background] Offscreen API not supported on this browser.");
+        return false;
+      }
+      if (await chrome.offscreen.hasDocument()) return true;
+      console.log("[Background] Creating offscreen document...");
+      await chrome.offscreen.createDocument({
+        url: "offscreen.html",
+        reasons: ["DOM_PARSER"],
+        justification: "Keep Native Messaging available for tur",
+      });
+      console.log("[Background] Offscreen document created.");
+      return true;
+    } catch (err) {
+      console.warn("[Background] Failed to set up offscreen document:", err);
+      offscreenPromise = null;
+      return false;
+    }
+  })();
+  return offscreenPromise;
 }
 
 chrome.runtime.onStartup.addListener(setupOffscreenDocument);
@@ -156,6 +371,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   hideOverlayForTab(tabId);
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete" && tab.active) {
+    console.log(`[Background] Tab updated (complete): tabId=${tabId}, url=${tab.url}`);
+    chrome.tabs.sendMessage(tabId, { type: "TUR_REQUEST_TARGETS" }).catch(() => {});
+  }
+});
+
 let focusTimeout = null;
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
@@ -201,7 +423,30 @@ function connectNative() {
     _reconnectAttempts = 0;      // reset on success
 
     nativePort.onMessage.addListener(async (msg) => {
-      if (msg && msg.type === "OVERLAY_MENU_SELECTED") {
+      if (msg && msg.type === "OVERLAY_DOWNLOAD_TRIGGER") {
+        console.log("[Background] Overlay download trigger received:", msg);
+        const tabId = msg.tabId;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          sendToHost({
+            action: "QUEUE_DOWNLOAD",
+            payload: {
+              url: msg.videoUrl,
+              audio_url: msg.audioUrl,
+              page_url: tab.url,
+              page_title: tab.title || "",
+              referer: msg.headers?.Referer || tab.url,
+              user_agent: msg.headers?.["User-Agent"] || navigator.userAgent,
+              cookie: msg.headers?.Cookie || "",
+              mediaType: msg.audioUrl ? "dash" : "direct",
+              category: "video",
+              label: `Downloaded via overlay`,
+            }
+          });
+        } catch (e) {
+          console.warn("[Background] Failed to process overlay download trigger:", e);
+        }
+      } else if (msg && msg.type === "OVERLAY_MENU_SELECTED") {
         console.log("[Background] Quality menu selection:", msg);
         const tabId = msg.tabId;
         try {
@@ -348,6 +593,7 @@ const beforeSendHeadersHandler = function(details) {
   const classified = TurDownloadClassifier.classifyDownload(details.url);
   if (!classified.downloadable && !classified.playable) return;
 
+  console.log(`[Background] Intercepted beforeSendHeaders: url=${details.url}, type=${details.type}, tabId=${details.tabId}`);
   const item = mediaItemFromClassification(details.url, classified, details.initiator || details.documentUrl || "");
   rememberTabMedia(details.tabId, item);
   notifyTab(details.tabId, item);
@@ -377,6 +623,7 @@ const headersReceivedHandler = function(details) {
   const classified = TurDownloadClassifier.classifyDownload(details.url, contentType, disposition);
   if (!classified.downloadable && !classified.playable && !classified.attachment) return;
 
+  console.log(`[Background] Intercepted headersReceived: url=${details.url}, contentType=${contentType}, tabId=${details.tabId}`);
   const item = mediaItemFromClassification(details.url, classified, details.initiator || details.documentUrl || "");
   rememberTabMedia(details.tabId, item);
   notifyTab(details.tabId, item);
@@ -398,6 +645,12 @@ try {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
+
+  if (message.type === "MANIFEST_PARSED") {
+    const { url, formats, success } = message;
+    handleManifestParsed(url, formats, success);
+    return true;
+  }
 
   if (message.type === "MEDIA_CANDIDATES" && Number.isInteger(tabId)) {
     rememberTabMediaBatch(tabId, message.payload?.media || []);
@@ -689,6 +942,10 @@ async function handleTargetsUpdate(tabId, tab, payload) {
       screenX: sx,
       screenY: sy,
       mediaUrl: t.mediaUrl || "",
+      duration: t.duration || 0,
+      cookie: t.cookie || "",
+      videoWidth: t.videoWidth || 0,
+      videoHeight: t.videoHeight || 0,
     };
   });
 
@@ -699,9 +956,92 @@ async function handleTargetsUpdate(tabId, tab, payload) {
     storedOffsets = await chrome.storage.local.get(storageKeys);
   } catch (_) {}
 
+  // Get tab's detected media list to resolve blob/empty targets
+  const mediaList = tabMedia.get(tabId) || [];
+  
+  // Sort HLS/DASH streams by URL length ascending to prefer master playlist over variant sub-playlists
+  const hlsStreams = mediaList.filter(m => m.mediaType === "hls" || m.mediaType === "dash");
+  hlsStreams.sort((a, b) => a.url.length - b.url.length);
+  
+  const resolvedStream = hlsStreams[0] || mediaList.find(m => m.playable);
+
   var targets = rawTargets.map(function(t, i) {
     const stored = storedOffsets[storageKeys[i]] || {};
-    return { ...t, dragOffsetX: stored.dx || 0, dragOffsetY: stored.dy || 0 };
+    let status = "pending";
+    let formats = [];
+    let targetUrl = t.mediaUrl;
+
+    if (!targetUrl || targetUrl.startsWith("blob:") || targetUrl.startsWith("data:")) {
+      if (resolvedStream) {
+        targetUrl = resolvedStream.url;
+      }
+    }
+
+    const mediaType = getMediaType(targetUrl);
+    if (mediaType) {
+      // HLS/DASH: try local manifest parser first, fall back to host yt-dlp via pending
+      const cached = getCachedManifest(targetUrl);
+      if (cached) {
+        status = "ready";
+        formats = cached.map(f => {
+          if ((!f.resolution || f.resolution === "0x0" || f.label.includes("Direct")) && t.videoWidth > 0 && t.videoHeight > 0) {
+            const enrichedLabel = makeJSLabel(t.videoWidth, t.videoHeight, t.duration || 0, 0, "HLS", 0, 0);
+            return {
+              ...f,
+              label: enrichedLabel,
+              resolution: `${t.videoWidth}x${t.videoHeight}`
+            };
+          }
+          return f;
+        });
+        console.log(`[Background] Target ${t.elementId} HLS/DASH cache HIT: url=${targetUrl}`);
+      } else {
+        status = "resolving";
+        console.log(`[Background] Target ${t.elementId} HLS/DASH cache MISS, resolving manifest: url=${targetUrl}`);
+        resolveManifest(tabId, targetUrl, mediaType, t.duration || 0);
+      }
+    } else if (isDirectMediaFile(targetUrl)) {
+      const cached = getCachedDirectFile(targetUrl);
+      if (cached) {
+        status = "ready";
+        formats = cached;
+        console.log(`[Background] Target ${t.elementId} direct file cache HIT: url=${targetUrl}`);
+      } else {
+        status = "resolving";
+        console.log(`[Background] Target ${t.elementId} direct file cache MISS, resolving HEAD: url=${targetUrl}`);
+        resolveDirectFile(tabId, targetUrl, t.videoWidth || 0, t.videoHeight || 0, t.duration || 0);
+      }
+    } else if (
+      !targetUrl ||
+      targetUrl.startsWith("blob:") ||
+      targetUrl.startsWith("data:") ||
+      isWalledGarden(targetUrl) ||
+      isWalledGarden(payload.pageUrl || (tab && tab.url))
+    ) {
+      // All of these need host-side yt-dlp extraction: blob/data, and walled gardens (YouTube/Vimeo/Twitch)
+      status = "pending";
+      console.log(`[Background] Target ${t.elementId} mapped to pending (walled garden/blob): url=${targetUrl}`);
+    } else {
+      // Unknown URL with no parseable extension — offer default download
+      status = "ready";
+      console.log(`[Background] Target ${t.elementId} mapped to ready (fallback direct): url=${targetUrl}`);
+      const ext = targetUrl.split(/[?#]/, 1)[0].split(".").pop().toUpperCase() || "DOWNLOAD";
+      formats = [{
+        label: `Download Stream (${ext})`,
+        videoUrl: targetUrl,
+        audioUrl: "",
+        resolution: ""
+      }];
+    }
+
+    return {
+      ...t,
+      mediaUrl: targetUrl,
+      dragOffsetX: stored.dx || 0,
+      dragOffsetY: stored.dy || 0,
+      status,
+      formats,
+    };
   });
 
   console.log("[Background] handleTargetsUpdate — corrected viewport", {
@@ -1142,4 +1482,218 @@ function truncate(value, max) {
 function findHeader(headers, name) {
   const header = headers.find((item) => item.name?.toLowerCase() === name);
   return header?.value || "";
+}
+
+// Helper URL resolver
+function resolveUrl(base, relative) {
+  try {
+    return new URL(relative, base).href;
+  } catch (_) {
+    return relative;
+  }
+}
+
+// Unified Option String Formatting Engine
+function makeJSLabel(width, height, durationSecs, fps, codecs, sizeBytes, bandwidthBps) {
+  const resBlock = (width > 0 && height > 0) ? `${width}x${height}` : "Audio";
+  
+  let durBlock = "";
+  if (durationSecs > 0) {
+    const totalSecs = Math.round(durationSecs);
+    const hours = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+    
+    const parts = [];
+    if (hours > 0) {
+      parts.push(`${hours}hr`);
+    }
+    if (mins > 0) {
+      parts.push(`${mins}min`);
+    }
+    if (secs > 0 || parts.length === 0) {
+      parts.push(`${secs}sec`);
+    }
+    durBlock = ` | ${parts.join(" ")}`;
+  }
+  
+  const fpsStr = fps > 0 ? `${Math.round(fps)}fps/` : "";
+  const codecBlock = ` | ${fpsStr}${cleanJSCodec(codecs)}`;
+  
+  let sizeVal = 0;
+  if (sizeBytes > 0) {
+    sizeVal = sizeBytes / (1024 * 1024);
+  } else if (bandwidthBps > 0 && durationSecs > 0) {
+    sizeVal = (bandwidthBps * durationSecs) / (8 * 1024 * 1024);
+  }
+  
+  let sizeBlock = "";
+  if (sizeVal > 0) {
+    if (sizeVal >= 1000) {
+      sizeBlock = ` | ~${(sizeVal / 1024).toFixed(2)}GB`;
+    } else {
+      sizeBlock = ` | ~${Math.round(sizeVal)}MB`;
+    }
+  }
+  
+  return `${resBlock}${durBlock}${codecBlock}${sizeBlock}`.trim();
+}
+
+function cleanJSCodec(raw) {
+  if (!raw) return "Video";
+  const parts = raw.split(',');
+  const cleaned = parts.map(p => {
+    const pTrim = p.trim().toLowerCase();
+    if (pTrim.includes("avc1") || pTrim.includes("h264")) return "h.264";
+    if (pTrim.includes("hev1") || pTrim.includes("hvc1") || pTrim.includes("h265")) return "h.265";
+    if (pTrim.includes("vp09") || pTrim.includes("vp9")) return "VP9";
+    if (pTrim.includes("av01") || pTrim.includes("av1")) return "AV1";
+    if (pTrim.includes("mp4a") || pTrim.includes("opus") || pTrim.includes("aac")) return "Audio";
+    return pTrim;
+  });
+  return cleaned.join(" + ");
+}
+
+function parseHLS(playlistText, manifestUrl) {
+  const lines = playlistText.split('\n');
+  const formats = [];
+  let currentStreamInf = null;
+
+  for (let line of lines) {
+    line = line.trim();
+    if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      currentStreamInf = line;
+    } else if (line && !line.startsWith('#') && currentStreamInf) {
+      const variantUrl = resolveUrl(manifestUrl, line);
+      let width = 0;
+      let height = 0;
+      let bandwidth = 0;
+      let frameRate = 30;
+      let codecs = "HLS";
+
+      const resMatch = currentStreamInf.match(/RESOLUTION=(\d+)x(\d+)/i);
+      if (resMatch) {
+        width = parseInt(resMatch[1], 10);
+        height = parseInt(resMatch[2], 10);
+      }
+
+      const bwMatch = currentStreamInf.match(/BANDWIDTH=(\d+)/i);
+      if (bwMatch) {
+        bandwidth = parseInt(bwMatch[1], 10);
+      }
+
+      const fpsMatch = currentStreamInf.match(/FRAME-RATE=([\d.]+)/i);
+      if (fpsMatch) {
+        frameRate = parseFloat(fpsMatch[1]);
+      }
+
+      const codecsMatch = currentStreamInf.match(/CODECS="([^"]+)"/i);
+      if (codecsMatch) {
+        codecs = codecsMatch[1];
+      }
+
+      const label = makeJSLabel(width, height, 0, frameRate, codecs, 0, bandwidth);
+      formats.push({
+        label,
+        videoUrl: variantUrl,
+        audioUrl: "",
+        resolution: `${width}x${height}`,
+      });
+
+      currentStreamInf = null;
+    }
+  }
+  return formats;
+}
+
+function parseDASH(xmlText, manifestUrl, duration) {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "text/xml");
+  
+  let mpdBase = "";
+  const mpdBaseEl = xml.querySelector("MPD > BaseURL");
+  if (mpdBaseEl) mpdBase = mpdBaseEl.textContent.trim();
+  
+  const periods = xml.querySelectorAll("Period");
+  const formats = [];
+  
+  for (const period of periods) {
+    let periodBase = "";
+    const periodBaseEl = period.querySelector("BaseURL");
+    if (periodBaseEl) periodBase = periodBaseEl.textContent.trim();
+    
+    const adaptationSets = period.querySelectorAll("AdaptationSet");
+    const videoRepresentations = [];
+    const audioRepresentations = [];
+    
+    for (const adapt of adaptationSets) {
+      let adaptBase = "";
+      const adaptBaseEl = adapt.querySelector("BaseURL");
+      if (adaptBaseEl) adaptBase = adaptBaseEl.textContent.trim();
+      
+      const mimeType = adapt.getAttribute("mimeType") || "";
+      const contentType = adapt.getAttribute("contentType") || "";
+      const isVideo = mimeType.startsWith("video") || contentType === "video" || adapt.querySelector("Representation[width]");
+      const isAudio = mimeType.startsWith("audio") || contentType === "audio";
+      
+      const representations = adapt.querySelectorAll("Representation");
+      for (const rep of representations) {
+        let repBase = "";
+        const repBaseEl = rep.querySelector("BaseURL");
+        if (repBaseEl) repBase = repBaseEl.textContent.trim();
+        
+        let relativeUrl = "";
+        if (repBase) relativeUrl = repBase;
+        else if (adaptBase) relativeUrl = adaptBase;
+        else if (periodBase) relativeUrl = periodBase;
+        else if (mpdBase) relativeUrl = mpdBase;
+        
+        const absoluteUrl = resolveUrl(manifestUrl, relativeUrl || "");
+        
+        const repData = {
+          id: rep.getAttribute("id") || "",
+          bandwidth: parseInt(rep.getAttribute("bandwidth") || "0", 10),
+          codecs: rep.getAttribute("codecs") || adapt.getAttribute("codecs") || "",
+          url: absoluteUrl,
+        };
+        
+        if (isVideo) {
+          repData.width = parseInt(rep.getAttribute("width") || "0", 10);
+          repData.height = parseInt(rep.getAttribute("height") || "0", 10);
+          repData.frameRate = parseFloat(rep.getAttribute("frameRate") || "30");
+          videoRepresentations.push(repData);
+        } else if (isAudio) {
+          audioRepresentations.push(repData);
+        }
+      }
+    }
+    
+    let bestAudio = null;
+    if (audioRepresentations.length > 0) {
+      bestAudio = audioRepresentations.reduce((best, current) => {
+        return (current.bandwidth > best.bandwidth) ? current : best;
+      }, audioRepresentations[0]);
+    }
+    
+    for (const v of videoRepresentations) {
+      const combinedBandwidth = v.bandwidth + (bestAudio ? bestAudio.bandwidth : 0);
+      const label = makeJSLabel(
+        v.width,
+        v.height,
+        duration || 0,
+        v.frameRate,
+        v.codecs,
+        0,
+        combinedBandwidth
+      );
+      
+      formats.push({
+        label,
+        videoUrl: v.url,
+        audioUrl: bestAudio ? bestAudio.url : "",
+        resolution: `${v.width}x${v.height}`,
+      });
+    }
+  }
+  return formats;
 }

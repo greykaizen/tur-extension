@@ -52,15 +52,23 @@ Copy-Item -Path (Join-Path $fontsSrc "LeMurmure.otf") -Destination (Join-Path $I
 Write-Host "  Custom fonts installed." -ForegroundColor Green
 
 # 3. Generate & Register Chromium Native Messaging Host Manifest
+$origins = @(
+    "chrome-extension://nkilabbnigegcggilmdjaepemndfance/", # Default developer ID
+    "chrome-extension://pfchlobngiipcgldghcmbhnbakbnnhfg/"  # User's Brave ID
+)
+if ($origins -notcontains "chrome-extension://$ExtensionId/") {
+    $origins += "chrome-extension://$ExtensionId/"
+}
+
 $Manifest = @{
     name            = "com.tur.native_host"
     description     = "tur Download Manager native messaging host"
     path            = $ExeDest
     type            = "stdio"
-    allowed_origins = @("chrome-extension://$ExtensionId/")
+    allowed_origins = $origins
 }
 $Manifest | ConvertTo-Json -Compress | Set-Content -Path $ManifestPath -Encoding UTF8
-Write-Host "  Chromium manifest generated (ID: $ExtensionId)" -ForegroundColor Green
+Write-Host "  Chromium manifest generated (origins: $($origins -join ', '))" -ForegroundColor Green
 
 $RegistryPaths = @(
     "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.tur.native_host",

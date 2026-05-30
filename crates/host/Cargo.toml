@@ -37,6 +37,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # WIC — PNG logo decode (IWICImagingFactory)
     "Win32_Graphics_Imaging",
+    # Clipboard & Memory management
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 # macOS-only AppKit bindings (NSPanel overlay skeleton)

@@ -83,6 +83,22 @@ document.addEventListener("visibilitychange", scheduleTargetReport, true);
 // MV3 workers suspend after ~30 s of idleness; a focus event re-activates them
 // before the content script's next rAF tick would otherwise miss the connection.
 window.addEventListener("focus", scheduleTargetReport, true);
+window.addEventListener("pageshow", (event) => {
+  console.log("[Content] pageshow event fired, persisted =", event.persisted);
+  scheduleTargetReport();
+}, true);
+
+const handleSPAHistoryChange = () => {
+  console.log("[Content] SPA navigation / history event detected. Flushing state and re-detecting...");
+  detectedUrls.clear();
+  lastTargetSignature = "";
+  lastCandidatesSignature = "";
+  refreshMediaElements();
+  reportCandidates();
+  scheduleTargetReport();
+};
+window.addEventListener("popstate", handleSPAHistoryChange, true);
+window.addEventListener("hashchange", handleSPAHistoryChange, true);
 
 setInterval(() => {
   if (!extensionAlive) return;
@@ -273,6 +289,12 @@ function collectAllTargets() {
       width: Math.round(rect.width),
       height: Math.round(rect.height),
       mediaUrl: elementUrl,
+      status: "pending",
+      formats: [],
+      cookie: document.cookie || "",
+      duration: (element.duration && !isNaN(element.duration)) ? element.duration : 0,
+      videoWidth: element.videoWidth || 0,
+      videoHeight: element.videoHeight || 0,
     });
   }
 
