@@ -1,10 +1,29 @@
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-/// Find the Chromium top-level root HWND that contains the given screen-space point.
+fn log_debug(msg: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
+    {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
+
+/// Get the window title of an HWND.
+unsafe fn get_window_title(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut buffer) as usize;
+    String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Find the browser top-level root HWND that contains the given screen-space point.
 /// Searches visible top-level windows whose class is Chrome_WidgetWin_1
-/// (or Chrome_WidgetWin_0) and whose rectangle contains the point.
-pub unsafe fn find_chromium_root_for_point(screen_x: i32, screen_y: i32) -> Option<HWND> {
+/// (or Chrome_WidgetWin_0, MozillaWindowClass) and whose rectangle contains the point.
+pub unsafe fn find_browser_root_for_point(screen_x: i32, screen_y: i32) -> Option<HWND> {
     struct Search {
         screen_x: i32,
         screen_y: i32,
@@ -19,17 +38,35 @@ pub unsafe fn find_chromium_root_for_point(screen_x: i32, screen_y: i32) -> Opti
         }
 
         let class = get_class_name(hwnd);
-        if class != "Chrome_WidgetWin_1" && class != "Chrome_WidgetWin_0" {
+        if class != "Chrome_WidgetWin_1"
+            && class != "Chrome_WidgetWin_0"
+            && class != "MozillaWindowClass"
+        {
             return true.into();
         }
 
+        let title = get_window_title(hwnd);
         let mut rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rect);
+
+        log_debug(&format!(
+            "[tur] Window candidate: hwnd={:?} class='{}' title='{}' rect={:?}",
+            hwnd, class, title, rect
+        ));
+
+        // Skip windows that are empty/invisible utility wrappers (which often have no title and small size)
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if (width <= 100 || height <= 100) && title.is_empty() {
+            log_debug(&format!("[tur]   -> skipping candidate due to empty title and small size"));
+            return true.into();
+        }
 
         // Check if the point is inside this window.
         if search.screen_x >= rect.left && search.screen_x < rect.right
             && search.screen_y >= rect.top && search.screen_y < rect.bottom
         {
+            log_debug(&format!("[tur]   -> matched point ({}, {})!", search.screen_x, search.screen_y));
             search.result = Some(hwnd);
             return false.into(); // Stop enumeration.
         }

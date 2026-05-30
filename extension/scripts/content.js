@@ -29,6 +29,10 @@ safeRuntimeListener((message) => {
     scheduleTargetReport();
     return { ok: true };
   }
+  if (message.type === "TUR_COPY_TO_CLIPBOARD") {
+    copyToClipboard(message.text);
+    return { ok: true };
+  }
   if (message.type !== "MEDIA_DETECTED_NETWORK") return;
   rememberMedia(message.url, message.mediaType, message.pageUrl, message.category, "network");
 });
@@ -259,8 +263,8 @@ function collectAllTargets() {
       ? (element.src || element.getAttribute("data-src") || "")
       : (element.currentSrc || element.src || element.data || "");
 
-    // Only include elements that have a detectable media source or are iframes
-    if (!elementUrl && tag !== "iframe") continue;
+    // Include video/audio elements even if their direct URL is empty/blob/lazy-loaded
+    if (!elementUrl && tag !== "iframe" && tag !== "video" && tag !== "audio") continue;
 
     results.push({
       elementId,
@@ -509,4 +513,20 @@ function teardown() {
 
 function isContextInvalidated(error) {
   return /extension context invalidated/i.test(String(error?.message || error));
+}
+
+function copyToClipboard(text) {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand("copy");
+    console.log("[tur] Copied to clipboard successfully:", text);
+  } catch (err) {
+    console.warn("[tur] copy to clipboard failed", err);
+  }
+  document.body.removeChild(textarea);
 }

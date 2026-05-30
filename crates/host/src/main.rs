@@ -306,13 +306,12 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
     let center_x = update.viewport_screen_x + update.viewport_width / 2;
     let center_y = update.viewport_screen_y + update.viewport_height / 2;
 
-    // Use the TOP-LEVEL Chrome_WidgetWin_1 as owner, NOT the child
-    // Chrome_RenderWidgetHostHWND. The DWM aggressively clips popups
+    // Use the TOP-LEVEL browser window as owner. The DWM aggressively clips popups
     // owned by deep child windows.
-    let root = window::find_chromium_root_for_point(center_x, center_y);
+    let root = window::find_browser_root_for_point(center_x, center_y);
     let owner = root.unwrap_or(HWND(null_mut()));
 
-    eprintln!(
+    log_debug(&format!(
         "[tur] tab={} targets={} viewport=({},{} {}x{}) root={:?} dpr={}",
         update.tab_id,
         update.targets.len(),
@@ -322,7 +321,7 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         update.viewport_height,
         root,
         update._device_pixel_ratio,
-    );
+    ));
 
     let overlay_targets: Vec<overlay::TargetInfo> = update
         .targets
@@ -387,4 +386,16 @@ fn detect_dark_mode() -> bool {
             Err(_) => false,
         }
     })
+}
+
+fn log_debug(msg: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
+    {
+        let _ = writeln!(file, "{}", msg);
+    }
 }

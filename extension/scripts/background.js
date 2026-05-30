@@ -48,18 +48,22 @@ const extensionSessionStorage = chrome.storage?.session ?? chrome.storage?.local
 const actionApi = chrome.action ?? chrome.browserAction;
 
 async function setupOffscreenDocument() {
-  if (typeof chrome.offscreen === "undefined") {
-    console.log("[Background] Offscreen API not supported on this browser.");
-    return;
+  try {
+    if (typeof chrome.offscreen === "undefined") {
+      console.log("[Background] Offscreen API not supported on this browser.");
+      return;
+    }
+    const OFFSCREEN_PATH = "offscreen.html";
+    if (await chrome.offscreen.hasDocument()) return;
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_PATH,
+      reasons: ["DOM_PARSER"],
+      justification: "Keep Native Messaging available for tur",
+    });
+    console.log("[Background] Offscreen document created.");
+  } catch (err) {
+    console.warn("[Background] Failed to set up offscreen document:", err);
   }
-  const OFFSCREEN_PATH = "offscreen.html";
-  if (await chrome.offscreen.hasDocument()) return;
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_PATH,
-    reasons: ["DOM_PARSER"],
-    justification: "Keep Native Messaging available for tur",
-  });
-  console.log("[Background] Offscreen document created.");
 }
 
 chrome.runtime.onStartup.addListener(setupOffscreenDocument);
@@ -180,12 +184,61 @@ function connectNative() {
     nativePort.onMessage.addListener(async (msg) => {
       if (msg && msg.type === "OVERLAY_MENU_SELECTED") {
         console.log("[Background] Quality menu selection:", msg);
-        // TODO: route msg.quality + msg.mediaUrl into the download pipeline.
+        const tabId = msg.tabId;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          const mediaList = tabMedia.get(tabId) || [];
+          let selectedItem = null;
+          if (msg.mediaUrl && !msg.mediaUrl.startsWith("blob:") && !msg.mediaUrl.startsWith("data:")) {
+            selectedItem = mediaList.find(item => item.url === msg.mediaUrl);
+          }
+          if (!selectedItem) {
+            selectedItem = mediaList.find(item => item.playable) || mediaList[0];
+          }
+          if (selectedItem) {
+            queueMediaItem({
+              ...selectedItem,
+              label: msg.quality ? `${selectedItem.label || shortName(selectedItem.url)} (${msg.quality})` : selectedItem.label
+            }, tab, { pageUrl: tab.url });
+          } else {
+            queuePage(tab, { pageUrl: tab.url });
+          }
+        } catch (e) {
+          console.warn("[Background] Failed to handle overlay menu selection:", e);
+        }
+      } else if (msg && msg.type === "OVERLAY_COPY_URL") {
+        console.log("[Background] Copy URL selection:", msg);
+        const tabId = msg.tabId;
+        try {
+          const mediaList = tabMedia.get(tabId) || [];
+          let selectedItem = null;
+          if (msg.mediaUrl && !msg.mediaUrl.startsWith("blob:") && !msg.mediaUrl.startsWith("data:")) {
+            selectedItem = mediaList.find(item => item.url === msg.mediaUrl);
+          }
+          if (!selectedItem) {
+            selectedItem = mediaList.find(item => item.playable) || mediaList[0];
+          }
+          const textToCopy = selectedItem ? selectedItem.url : (msg.mediaUrl || "");
+          if (textToCopy) {
+            chrome.tabs.sendMessage(tabId, { type: "TUR_COPY_TO_CLIPBOARD", text: textToCopy }).catch(() => {});
+          }
+        } catch (e) {
+          console.warn("[Background] Failed to handle overlay copy URL:", e);
+        }
       } else if (msg && msg.type === "OVERLAY_DRAG_MOVED") {
         // Persist the new HUD drag offset so it survives page reloads.
-        // Key is canonicalized to survive query-param churn on YouTube/Imgur.
+        // Key is canonicalized to survive query-param churn on YouTube/Imgur/Reddit.
         if (msg.mediaUrl) {
-          const key = `drag_${canonicalMediaKey(msg.mediaUrl)}`;
+          let keyUrl = msg.mediaUrl;
+          if (!keyUrl || keyUrl.startsWith("blob:") || keyUrl.startsWith("data:")) {
+            try {
+              const tab = await chrome.tabs.get(msg.tabId);
+              if (tab && tab.url) {
+                keyUrl = tab.url;
+              }
+            } catch (_) {}
+          }
+          const key = `drag_${canonicalMediaKey(keyUrl)}`;
           try {
             await chrome.storage.local.set({ [key]: { dx: msg.dx || 0, dy: msg.dy || 0 } });
             console.log("[Background] Drag offset persisted", key, msg.dx, msg.dy);
