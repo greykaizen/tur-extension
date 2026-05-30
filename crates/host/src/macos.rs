@@ -17,11 +17,12 @@ use std::sync::OnceLock;
 use dispatch::Queue;
 
 use objc2::*;
-use objc2::declare::ClassDecl;
+use objc2::runtime::{Sel, AnyObject, ClassBuilder};
+use objc2::ffi::BOOL;
 use objc2_foundation::*;
 use objc2_app_kit::*;
 
-use crate::types::{CanvasUpdate, FormatInfo, TargetInfo, TargetStatus, TargetsUpdate};
+use crate::types::{CanvasUpdate, FormatInfo, TargetInfo, TargetsUpdate};
 use crate::ytdlp_parse::parse_ytdlp_output;
 
 // ── HUD layout constants (logical points, matching Windows HUD_H=24) ────
@@ -87,8 +88,8 @@ pub fn init() {
         let accessory = NSApplicationActivationPolicy::Accessory;
         let _: () = msg_send![shared, setActivationPolicy: accessory];
         // Register for screen change notifications
-        let nc: *mut NSObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let nc: *mut NSObject = msg_send![nc, notificationCenter];
+        let ws: *mut NSObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let nc: *mut NSObject = msg_send![ws, notificationCenter];
         let sel = sel!(activeDisplayDidChangeNotification);
         let obs: *mut NSObject = msg_send![class!(NSObject), new];
         let _: () = msg_send![nc, addObserver: obs
@@ -151,7 +152,7 @@ fn update_inner(cu: CanvasUpdate) {
 
         // Compute panel frame in Cocoa coordinates (Y-flip)
         let panel_w = t.width.max(1) as f64;
-        let panel_h = t.height.max(1) as f64;
+        let panel_h = t._height.max(1) as f64;
         let panel_x = t.screen_x as f64;
         let panel_y = screen_h - (t.screen_y as f64 + panel_h); // Y-flip
 
@@ -171,12 +172,14 @@ fn update_inner(cu: CanvasUpdate) {
             rec.screen_x = t.screen_x;
             rec.screen_y = t.screen_y;
             rec.width = t.width;
-            rec.height = t.height;
+            rec.height = t._height;
         } else {
             // Create a new NSPanel
-            let panel = create_panel(panel_x, panel_y - HUD_H - HUD_GAP,
-                                     panel_w, panel_h + HUD_H + HUD_GAP,
-                                     &t.element_id, &cu);
+            let panel = unsafe {
+                create_panel(panel_x, panel_y - HUD_H - HUD_GAP,
+                             panel_w, panel_h + HUD_H + HUD_GAP,
+                             &t.element_id, &cu)
+            };
             if !panel.is_null() {
                 lock.push(PanelRecord {
                     panel,
@@ -185,7 +188,7 @@ fn update_inner(cu: CanvasUpdate) {
                     screen_x: t.screen_x,
                     screen_y: t.screen_y,
                     width: t.width,
-                    height: t.height,
+                    height: t._height,
                 });
             }
         }
@@ -289,7 +292,7 @@ unsafe fn create_panel(x: f64, y: f64, w: f64, h: f64,
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
     let panel: *mut NSObject = msg_send![panel, initWithContentRect: frame
                                                styleMask: NSWindowStyleMask::Borderless
-                                                 backing: NSBackingStoreType::Buffered
+                                                 backing: 2
                                                    defer: NO];
 
     if panel.is_null() {
@@ -314,10 +317,8 @@ unsafe fn create_panel(x: f64, y: f64, w: f64, h: f64,
     let view: *mut NSObject = msg_send![view, initWithFrame: view_frame];
 
     if !view.is_null() {
-        // Store metadata via set_ivar on the custom view
-        let eid_ns: *mut NSString = NSString::from_str(element_id);
-        (*view).set_ivar::<*mut NSObject>("_elementId", eid_ns as *mut NSObject);
-        (*view).set_ivar::<*mut NSObject>("_parentPanel", panel);
+        // Store parent panel reference via associated object on the custom view
+        set_parent_panel(view, panel);
         let _: () = msg_send![panel, setContentView: view];
 
         // Update the panel's record to point to this view
@@ -345,11 +346,11 @@ unsafe fn create_panel(x: f64, y: f64, w: f64, h: f64,
 fn detect_dark_mode() -> bool {
     unsafe {
         let stds: *mut NSObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let key: *mut NSString = NSString::from_str("AppleInterfaceStyle");
-        let value: *mut NSObject = msg_send![stds, stringForKey: key];
+        let key = NSString::from_str("AppleInterfaceStyle");
+        let value: *mut NSObject = msg_send![stds, stringForKey: &*key];
         if !value.is_null() {
-            let dark_str: *mut NSString = NSString::from_str("Dark");
-            let is_dark: BOOL = msg_send![value, isEqualToString: dark_str];
+            let dark_str = NSString::from_str("Dark");
+            let is_dark: BOOL = msg_send![value, isEqualToString: &*dark_str];
             is_dark == YES
         } else {
             false
@@ -524,10 +525,9 @@ fn run_ytdlp_macos(url: &str, cookie: &str, user_agent: &str, referer: &str) -> 
 //
 // Ivars (declared in register_button_overlay_view):
 //   _parentPanel  *mut NSObject  — owning NSPanel
-//   _elementId    *mut NSObject  — NSString* with element ID
-//   _canvasData   *mut c_void    — raw pointer to serialised CanvasUpdate data
 
-extern "C" fn button_overlay_view_draw_rect(this: &NSObject, _: Sel, _dirty_rect: NSRect) {
+unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel, _dirty_rect: NSRect) {
+    let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
         let ctx: *mut NSObject = msg_send![class!(NSGraphicsContext), currentContext];
         if ctx.is_null() { return; }
@@ -592,7 +592,7 @@ extern "C" fn button_overlay_view_draw_rect(this: &NSObject, _: Sel, _dirty_rect
 
         // ── Draw text pill ────────────────────────────────────────────────
         let text_pill_x = container_x + PILL_START_X;
-        let text_pill_w = 80.0; // computed dynamically in full implementation
+        let text_pill_w = 80.0;
         let text_pill_h = HUD_H - 4.0;
         let text_pill_y = container_y + 2.0;
 
@@ -643,15 +643,16 @@ extern "C" fn button_overlay_view_draw_rect(this: &NSObject, _: Sel, _dirty_rect
         CGContextClosePath(cg);
         CGContextFillPath(cg);
 
-        // Draw "×" symbol (UTF-8 encoding: C3 97)
+        // Draw "×" symbol (MacRoman encoding: byte 0xD7 = multiplication sign)
         CGContextSetRGBFillColor(cg, text_r, text_g, text_b, 0.8);
         CGContextSelectFont(cg, b"Helvetica\0" as *const u8 as *const i8, 12.0, kCGEncodingMacRoman);
         CGContextShowTextAtPoint(cg, x_pill_x + 7.0, text_pill_y + 3.0,
-                                 b"\xC3\x97\0" as *const u8 as *const i8, 1);
+                                 b"\xD7\0" as *const u8 as *const i8, 1);
     }
 }
 
-extern "C" fn button_overlay_view_mouse_down(this: &NSObject, _: Sel, event: *mut NSObject) {
+unsafe extern "C" fn button_overlay_view_mouse_down(this: *mut AnyObject, _: Sel, event: *mut NSObject) {
+    let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
         let loc: NSPoint = msg_send![event, locationInWindow];
         let bounds: NSRect = msg_send![this, bounds];
@@ -677,7 +678,7 @@ extern "C" fn button_overlay_view_mouse_down(this: &NSObject, _: Sel, event: *mu
             } else if loc.x >= x_pill_x && loc.x < x_pill_x + X_W {
                 // X pill — dismiss
                 log_msg("mouseDown: X pill — dismiss");
-                let panel: *mut NSObject = *this.get_ivar::<*mut NSObject>("_parentPanel");
+                let panel = get_parent_panel(this as *const NSObject as *mut NSObject);
                 if !panel.is_null() {
                     let _: () = msg_send![panel, orderOut: std::ptr::null_mut::<NSObject>()];
                 }
@@ -690,9 +691,10 @@ extern "C" fn button_overlay_view_mouse_down(this: &NSObject, _: Sel, event: *mu
     }
 }
 
-extern "C" fn button_overlay_view_mouse_dragged(this: &NSObject, _: Sel, event: *mut NSObject) {
+unsafe extern "C" fn button_overlay_view_mouse_dragged(this: *mut AnyObject, _: Sel, event: *mut NSObject) {
+    let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
-        let panel: *mut NSObject = *this.get_ivar::<*mut NSObject>("_parentPanel");
+        let panel = get_parent_panel(this as *const NSObject as *mut NSObject);
         if panel.is_null() { return; }
 
         let delta: NSPoint = msg_send![event, deltaInWindow];
@@ -703,7 +705,8 @@ extern "C" fn button_overlay_view_mouse_dragged(this: &NSObject, _: Sel, event: 
     }
 }
 
-extern "C" fn button_overlay_view_mouse_up(this: &NSObject, _: Sel, event: *mut NSObject) {
+unsafe extern "C" fn button_overlay_view_mouse_up(this: *mut AnyObject, _: Sel, event: *mut NSObject) {
+    let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
         log_msg("mouseUp: drag committed (if any)");
         let superclass = class!(NSView);
@@ -715,8 +718,9 @@ extern "C" fn button_overlay_view_mouse_up(this: &NSObject, _: Sel, event: *mut 
 
 /// Show an NSMenu popup with quality options.
 unsafe fn show_quality_menu(view: &NSObject, event: *mut NSObject) {
+    let quality_title = NSString::from_str("Quality");
     let menu: *mut NSObject = msg_send![class!(NSMenu), alloc];
-    let menu: *mut NSObject = msg_send![menu, initWithTitle: NSString::from_str("Quality")];
+    let menu: *mut NSObject = msg_send![menu, initWithTitle: &*quality_title];
 
     // Add default items
     let items = [
@@ -727,9 +731,11 @@ unsafe fn show_quality_menu(view: &NSObject, event: *mut NSObject) {
     ];
     for &title in &items {
         let item: *mut NSObject = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut NSObject = msg_send![item, initWithTitle: NSString::from_str(title)
+        let item_title = NSString::from_str(title);
+        let empty_key = NSString::from_str("");
+        let item: *mut NSObject = msg_send![item, initWithTitle: &*item_title
                                                    action: sel!(menuItemSelected:)
-                                            keyEquivalent: NSString::from_str("")];
+                                            keyEquivalent: &*empty_key];
         let _: () = msg_send![menu, addItem: item];
         let _: () = msg_send![item, setTarget: view as *const NSObject as *mut NSObject];
         let _: () = msg_send![item, release];
@@ -746,7 +752,7 @@ unsafe fn show_quality_menu(view: &NSObject, event: *mut NSObject) {
     let _: () = msg_send![menu, release];
 }
 
-extern "C" fn button_overlay_view_menu_item_selected(this: &NSObject, _: Sel, sender: *mut NSObject) {
+unsafe extern "C" fn button_overlay_view_menu_item_selected(_this: *mut AnyObject, _: Sel, sender: *mut NSObject) {
     unsafe {
         let title: *mut NSObject = msg_send![sender, title];
         let title_str: *mut NSString = msg_send![title, description];
@@ -778,40 +784,66 @@ extern "C" {
 }
 
 const kCGEncodingMacRoman: i32 = 0;
-const YES: BOOL = 1 as BOOL;
-const NO:  BOOL = 0 as BOOL;
+const YES: BOOL = 1i8 as BOOL;
+const NO:  BOOL = 0i8 as BOOL;
+
+// ── Associated Object helpers ────────────────────────────────────────────────
+// We use the Objective-C runtime's associated object API to attach the parent
+// NSPanel pointer to each ButtonOverlayView instance.
+
+const OBJC_ASSOCIATION_RETAIN: usize = 0x301;
+
+extern "C" {
+    fn objc_setAssociatedObject(
+        object: *mut NSObject,
+        key: *const c_void,
+        value: *mut NSObject,
+        policy: usize,
+    );
+    fn objc_getAssociatedObject(
+        object: *mut NSObject,
+        key: *const c_void,
+    ) -> *mut NSObject;
+}
+
+/// Returns a stable pointer to use as an associated object key.
+fn parent_panel_key() -> *const c_void {
+    static KEY: u8 = 0;
+    &KEY as *const u8 as *const c_void
+}
+
+unsafe fn set_parent_panel(view: *mut NSObject, panel: *mut NSObject) {
+    objc_setAssociatedObject(view, parent_panel_key(), panel, OBJC_ASSOCIATION_RETAIN);
+}
+
+unsafe fn get_parent_panel(view: *mut NSObject) -> *mut NSObject {
+    objc_getAssociatedObject(view, parent_panel_key())
+}
 
 // ── Class registration: ButtonOverlayView ─────────────────────────────────────
-//
-// We register our custom NSView subclass manually so it can override
-// drawRect:, mouseDown:, mouseDragged:, mouseUp: via C function callbacks.
-
-use std::ffi::CString;
 
 fn register_button_overlay_view() {
-    let name = CString::new("ButtonOverlayView").unwrap();
     let super_cls = class!(NSView);
-    let mut decl = ClassDecl::new(&name, super_cls)
+    let mut builder = ClassBuilder::new("ButtonOverlayView", super_cls)
         .expect("Failed to allocate ButtonOverlayView class");
 
     unsafe {
         // Add ivars
-        decl.add_ivar::<*mut NSObject>("_parentPanel");
-        decl.add_ivar::<*mut NSObject>("_elementId");
+        builder.add_ivar::<*mut NSObject>("_parentPanel");
 
         // Add methods
-        decl.add_method(sel!(drawRect:),
-            button_overlay_view_draw_rect as extern "C" fn(&NSObject, Sel, NSRect));
-        decl.add_method(sel!(mouseDown:),
-            button_overlay_view_mouse_down as extern "C" fn(&NSObject, Sel, *mut NSObject));
-        decl.add_method(sel!(mouseDragged:),
-            button_overlay_view_mouse_dragged as extern "C" fn(&NSObject, Sel, *mut NSObject));
-        decl.add_method(sel!(mouseUp:),
-            button_overlay_view_mouse_up as extern "C" fn(&NSObject, Sel, *mut NSObject));
-        decl.add_method(sel!(menuItemSelected:),
-            button_overlay_view_menu_item_selected as extern "C" fn(&NSObject, Sel, *mut NSObject));
+        builder.add_method(sel!(drawRect:),
+            button_overlay_view_draw_rect as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect));
+        builder.add_method(sel!(mouseDown:),
+            button_overlay_view_mouse_down as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
+        builder.add_method(sel!(mouseDragged:),
+            button_overlay_view_mouse_dragged as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
+        builder.add_method(sel!(mouseUp:),
+            button_overlay_view_mouse_up as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
+        builder.add_method(sel!(menuItemSelected:),
+            button_overlay_view_menu_item_selected as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
 
-        decl.register();
+        builder.register();
     }
     log_msg("ButtonOverlayView class registered");
 }
