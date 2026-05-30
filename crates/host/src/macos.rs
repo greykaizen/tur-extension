@@ -5,9 +5,13 @@
 //   Browser sends Y from top of screen (CSS convention).
 //   Cocoa uses Y from bottom of screen. Convert via:
 //     cocoa_y = screen_height - browser_y - panel_height
+//
+// HUD panel is sized to only the button area (~133x24 pt), NOT the full video,
+// so mouse events pass through to the browser for the video player itself.
 
 #![allow(non_snake_case, dead_code)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +26,7 @@ use objc2::ffi::BOOL;
 use objc2_foundation::*;
 use objc2_app_kit::*;
 
-use crate::types::{CanvasUpdate, FormatInfo, TargetInfo, TargetsUpdate};
+use crate::types::{CanvasUpdate, FormatInfo, TargetInfo, TargetsUpdate, TargetStatus};
 use crate::ytdlp_parse::parse_ytdlp_output;
 
 // ── HUD layout constants (logical points, matching Windows HUD_H=24) ────
@@ -41,15 +45,24 @@ const FONT_SIZE: f64 = 10.0;
 
 const PILL_START_X: f64 = LOGO_L + LOGO_SZ + PILL_GAP_L; // = 23.0
 
+/// Compute the HUD button container width (depends only on layout constants).
+fn container_width() -> f64 {
+    LOGO_L + LOGO_SZ + PILL_GAP_L + 80.0 + PILL_GAP_M + X_W + R_PAD
+}
+
 // ── Global state ─────────────────────────────────────────────────────────────
 
 struct PanelRecord {
-    panel: *mut NSObject,   // strong ref to NSPanel
-    view: *mut NSObject,    // strong ref to ButtonOverlayView
+    panel: *mut NSObject,
+    view: *mut NSObject,
     element_id: String,
+    /// The C「lient/raw screen x of the associated video element (CSS coords).
     screen_x: i32,
+    /// The client/raw screen y of the associated video element (CSS coords).
     screen_y: i32,
+    /// Video element width.
     width: i32,
+    /// Video element height.
     height: i32,
 }
 
@@ -62,6 +75,25 @@ fn panels() -> &'static Mutex<Vec<PanelRecord>> {
     PANELS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Per-target metadata cache — used for yt-dlp state machine & quality menu.
+struct TargetCacheEntry {
+    status: TargetStatus,
+    formats: Vec<FormatInfo>,
+    tab_id: i32,
+    media_url: String,
+    referer: String,
+    user_agent: String,
+    cookie: String,
+    drag_offset_x: i32,
+    drag_offset_y: i32,
+}
+
+static TARGET_CACHE: OnceLock<Mutex<HashMap<String, TargetCacheEntry>>> = OnceLock::new();
+
+fn target_cache() -> &'static Mutex<HashMap<String, TargetCacheEntry>> {
+    TARGET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn log_msg(msg: &str) {
     let path = std::env::temp_dir().join("tur-overlay.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -69,6 +101,20 @@ fn log_msg(msg: &str) {
     {
         use std::io::Write;
         let _ = writeln!(f, "[macos] {}", msg);
+    }
+}
+
+// ── Native messaging IPC ─────────────────────────────────────────────────────
+/// Write a JSON response back to the browser extension via stdout
+/// (native messaging protocol: 4-byte LE length prefix + UTF-8 JSON body).
+fn write_response(value: &serde_json::Value) {
+    use std::io::Write;
+    if let Ok(json) = serde_json::to_string(value) {
+        let len = (json.len() as u32).to_le_bytes();
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&len);
+        let _ = out.write_all(json.as_bytes());
+        let _ = out.flush();
     }
 }
 
@@ -101,8 +147,7 @@ pub fn init() {
 }
 
 /// Own the macOS event loop. Drains `rx` via GCD dispatch to the main queue,
-/// then calls `NSApplication::run()` on the main thread (this blocks forever
-/// until the application terminates).
+/// then calls `NSApplication::run()` on the main thread (this blocks forever).
 pub fn run(rx: mpsc::Receiver<TargetsUpdate>) {
     log_msg("run: entering event loop");
 
@@ -111,9 +156,33 @@ pub fn run(rx: mpsc::Receiver<TargetsUpdate>) {
     std::thread::spawn(move || {
         while let Ok(update) = rx.recv() {
             let cu = build_canvas_update(&update);
+            // Perform yt-dlp resolution on the background thread, then dispatch
+            // the panel update to the main thread.
+            let targets_needing_resolve = resolve_pending_targets(&update);
             Queue::main().exec_async(move || {
                 update_inner(cu);
             });
+            // Kick off async yt-dlp for targets that need it (after the main
+            // thread has created their panels).
+            for eid in targets_needing_resolve {
+                if let Some(t) = update.targets.iter().find(|t| t.element_id == eid) {
+                    let resolve_url = if t.media_url.starts_with("blob:")
+                        || t.media_url.starts_with("data:")
+                        || t.media_url.is_empty()
+                    {
+                        update.page_url.clone()
+                    } else {
+                        t.media_url.clone()
+                    };
+                    spawn_ytdlp_resolve(
+                        eid,
+                        resolve_url,
+                        t.cookie.clone(),
+                        update.user_agent.clone(),
+                        update.referer.clone(),
+                    );
+                }
+            }
         }
         // Channel closed — tell main thread to quit
         log_msg("run: channel closed, posting NSApp terminate");
@@ -125,7 +194,7 @@ pub fn run(rx: mpsc::Receiver<TargetsUpdate>) {
         });
     });
 
-    // Block the main thread on NSApp run (processes events forever).
+    // Block the main thread on NSApp run.
     unsafe {
         let app: *mut NSObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, run];
@@ -133,10 +202,9 @@ pub fn run(rx: mpsc::Receiver<TargetsUpdate>) {
     log_msg("run: NSApp.run() returned");
 }
 
-/// Called from main thread via GCD dispatch. Reconciles the overlay panels
+/// Called from main thread via GCD dispatch. Reconciles overlay panels
 /// with the incoming canvas update.
 fn update_inner(cu: CanvasUpdate) {
-    // Detect dark mode changes at runtime
     IS_DARK.store(detect_dark_mode(), Ordering::Relaxed);
 
     if cu.targets.is_empty() || cu.viewport_width <= 0 || cu.viewport_height <= 0 {
@@ -146,39 +214,99 @@ fn update_inner(cu: CanvasUpdate) {
 
     let mut current_ids: Vec<&str> = Vec::new();
     let screen_h = primary_screen_height();
+    let cw = container_width();
 
     for t in &cu.targets {
         current_ids.push(&t.element_id);
 
-        // Compute panel frame in Cocoa coordinates (Y-flip)
-        let panel_w = t.width.max(1) as f64;
-        let panel_h = t._height.max(1) as f64;
-        let panel_x = t.screen_x as f64;
-        let panel_y = screen_h - (t.screen_y as f64 + panel_h); // Y-flip
+        // ── Compute HUD panel frame ────────────────────────────────────────
+        // CSS position: top-right of video element, above it by HUD_GAP.
+        //   css_hud_x = t.screen_x + t.width - cw
+        //   css_hud_y = t.screen_y - HUD_H - HUD_GAP    (top edge of HUD)
+        //
+        // Cocoa (y-flip): origin is the BOTTOM of the rect.
+        //   cocoa_hud_bottom = screen_h - (t.screen_y - HUD_GAP)
+        //                    = screen_h - t.screen_y + HUD_GAP
+        //
+        // Apply saved drag offset (CSS coords → flip Y for Cocoa):
+        //   cocoa_x = css_x + drag_offset_x
+        //   cocoa_y = cocoa_bottom - drag_offset_y   (negative CSS up = up in Cocoa)
 
-        // Check if this element already has a panel
+        let css_hud_x = t.screen_x as f64 + t.width as f64 - cw;
+        let cocoa_hud_bottom = screen_h - t.screen_y as f64 + HUD_GAP;
+
+        let panel_x = css_hud_x + t.drag_offset_x as f64;
+        let panel_y = cocoa_hud_bottom - t.drag_offset_y as f64;
+
+        // Panel is sized to only the HUD button, not the full video
+        let panel_w = cw;
+        let panel_h = HUD_H;
+
+        // ── State machine: preserve cached resolved status ──────────────────
+        let _needs_resolve = {
+            let mut cache = target_cache().lock().unwrap();
+            match t.status {
+                TargetStatus::Ready | TargetStatus::Resolving => {
+                    // Extension has newer info — update cache
+                    cache.insert(t.element_id.clone(), TargetCacheEntry {
+                        status: t.status,
+                        formats: t.formats.clone(),
+                        tab_id: cu.tab_id,
+                        media_url: t.media_url.clone(),
+                        referer: cu.referer.clone(),
+                        user_agent: cu.user_agent.clone(),
+                        cookie: t.cookie.clone(),
+                        drag_offset_x: t.drag_offset_x,
+                        drag_offset_y: t.drag_offset_y,
+                    });
+                    false
+                }
+                TargetStatus::Pending => {
+                    if let Some(entry) = cache.get(&t.element_id) {
+                        if entry.status == TargetStatus::Resolving
+                            || entry.status == TargetStatus::Ready
+                        {
+                            // Preserve cached resolved state
+                            false
+                        } else {
+                            true // needs fresh resolve
+                        }
+                    } else {
+                        true // new target, needs resolve
+                    }
+                }
+            }
+        };
+
+        // Update cache with current drag offset if needed
+        {
+            let mut cache = target_cache().lock().unwrap();
+            if let Some(entry) = cache.get_mut(&t.element_id) {
+                entry.drag_offset_x = t.drag_offset_x;
+                entry.drag_offset_y = t.drag_offset_y;
+            }
+        }
+
+        // ── Create or reposition panel ─────────────────────────────────────
         let mut lock = panels().lock().unwrap();
         let existing_idx = lock.iter().position(|p| p.element_id == t.element_id);
 
         if let Some(idx) = existing_idx {
-            // Reposition existing panel
+            // Reposition AND resize existing panel
             unsafe {
                 let rec = &lock[idx];
-                let _: () = msg_send![rec.panel, setFrameOrigin: NSPoint::new(panel_x, panel_y - HUD_H - HUD_GAP)];
-                let _: () = msg_send![rec.view, setNeedsDisplay: YES];
+                let frame = NSRect::new(NSPoint::new(panel_x, panel_y), NSSize::new(panel_w, panel_h));
+                let _: () = msg_send![rec.panel, setFrame: frame display: YES];
             }
-            // Update stored coordinates
             let rec = &mut lock[idx];
             rec.screen_x = t.screen_x;
             rec.screen_y = t.screen_y;
             rec.width = t.width;
             rec.height = t._height;
         } else {
-            // Create a new NSPanel
+            // Create a new HUD-sized NSPanel
             let panel = unsafe {
-                create_panel(panel_x, panel_y - HUD_H - HUD_GAP,
-                             panel_w, panel_h + HUD_H + HUD_GAP,
-                             &t.element_id, &cu)
+                create_panel(panel_x, panel_y, panel_w, panel_h, &t.element_id)
             };
             if !panel.is_null() {
                 lock.push(PanelRecord {
@@ -202,6 +330,10 @@ fn update_inner(cu: CanvasUpdate) {
             else {
                 unsafe {
                     let _: () = msg_send![p.panel, orderOut: std::ptr::null_mut::<NSObject>()];
+                    // Break retain cycle: nil out parent panel association before releasing
+                    if !p.view.is_null() {
+                        set_parent_panel(p.view, std::ptr::null_mut());
+                    }
                     let _: () = msg_send![p.panel, release];
                     if !p.view.is_null() {
                         let _: () = msg_send![p.view, release];
@@ -249,6 +381,54 @@ fn build_canvas_update(update: &TargetsUpdate) -> CanvasUpdate {
     }
 }
 
+/// Check the yt-dlp state machine: return element_ids that need async yt-dlp
+/// resolution (new Pending targets not already cached as Resolving/Ready).
+fn resolve_pending_targets(update: &TargetsUpdate) -> Vec<String> {
+    let mut needs_resolve = Vec::new();
+    let mut cache = target_cache().lock().unwrap();
+
+    for t in &update.targets {
+        if t.status != TargetStatus::Pending {
+            // Extension has definitive status — update cache
+            cache.insert(t.element_id.clone(), TargetCacheEntry {
+                status: t.status,
+                formats: t.formats.clone(),
+                tab_id: update.tab_id,
+                media_url: t.media_url.clone(),
+                referer: update.referer.clone(),
+                user_agent: update.user_agent.clone(),
+                cookie: t.cookie.clone(),
+                drag_offset_x: t.drag_offset_x,
+                drag_offset_y: t.drag_offset_y,
+            });
+            continue;
+        }
+
+        // Pending — check if we already have a resolved/ing state
+        let already_resolved = cache.get(&t.element_id)
+            .map(|e| e.status == TargetStatus::Resolving || e.status == TargetStatus::Ready)
+            .unwrap_or(false);
+
+        if !already_resolved {
+            // Mark as resolving in cache and queue for yt-dlp
+            cache.insert(t.element_id.clone(), TargetCacheEntry {
+                status: TargetStatus::Resolving,
+                formats: Vec::new(),
+                tab_id: update.tab_id,
+                media_url: t.media_url.clone(),
+                referer: update.referer.clone(),
+                user_agent: update.user_agent.clone(),
+                cookie: t.cookie.clone(),
+                drag_offset_x: t.drag_offset_x,
+                drag_offset_y: t.drag_offset_y,
+            });
+            needs_resolve.push(t.element_id.clone());
+        }
+    }
+
+    needs_resolve
+}
+
 /// Hide all overlay panels.
 pub fn hide() {
     Queue::main().exec_async(|| {
@@ -272,6 +452,10 @@ pub fn destroy() {
         let mut lock = panels().lock().unwrap();
         for p in lock.drain(..) {
             let _: () = msg_send![p.panel, orderOut: std::ptr::null_mut::<NSObject>()];
+            // Break retain cycle: nil out parent panel association before releasing
+            if !p.view.is_null() {
+                set_parent_panel(p.view, std::ptr::null_mut());
+            }
             let _: () = msg_send![p.panel, release];
             if !p.view.is_null() {
                 let _: () = msg_send![p.view, release];
@@ -282,10 +466,13 @@ pub fn destroy() {
 
 // ── NSPanel creation ──────────────────────────────────────────────────────────
 
-/// Create a single transparent NSPanel with a custom ButtonOverlayView
-/// that draws the HUD pill button above the media element.
+/// Create a single transparent NSPanel sized to just the HUD button area.
+///
+/// The panel is created borderless with a clear background, floating above
+/// all normal windows, and only covers ~133×24 pt so mouse events pass
+/// through to the browser video player naturally.
 unsafe fn create_panel(x: f64, y: f64, w: f64, h: f64,
-                       element_id: &str, _cu: &CanvasUpdate) -> *mut NSObject {
+                       element_id: &str) -> *mut NSObject {
     let panel_cls = class!(NSPanel);
     let panel: *mut NSObject = msg_send![panel_cls, alloc];
 
@@ -317,17 +504,18 @@ unsafe fn create_panel(x: f64, y: f64, w: f64, h: f64,
     let view: *mut NSObject = msg_send![view, initWithFrame: view_frame];
 
     if !view.is_null() {
-        // Store parent panel reference via associated object on the custom view
+        // Store parent panel + element_id via associated objects (ASSIGN policy
+        // to avoid retain cycles — the panel retains the view as contentView).
         set_parent_panel(view, panel);
+        set_element_id_str(view, element_id);
         let _: () = msg_send![panel, setContentView: view];
 
         // Update the panel's record to point to this view
+        // Note: no manual retain — setContentView: retains the view,
+        // and the panel is already at retain=1 from alloc/init.
         let mut lock = panels().lock().unwrap();
         if let Some(last) = lock.last_mut() {
             last.view = view;
-            // Retain both (panel is already retained from init; view too)
-            let _: () = msg_send![panel, retain];
-            let _: () = msg_send![view, retain];
         }
 
         // Show the panel
@@ -372,33 +560,34 @@ fn primary_screen_height() -> f64 {
     }
 }
 
-fn primary_screen_width() -> f64 {
-    unsafe {
-        let screens: *mut NSObject = msg_send![class!(NSScreen), screens];
-        if screens.is_null() { return 1024.0; }
-        let count: NSUInteger = msg_send![screens, count];
-        if count == 0 { return 1024.0; }
-        let primary: *mut NSObject = msg_send![screens, objectAtIndex: 0];
-        let frame: NSRect = msg_send![primary, frame];
-        frame.size.width
-    }
-}
-
 // ── yt-dlp integration ───────────────────────────────────────────────────────
 
-/// Run yt-dlp on macOS. Tries PATH, then Homebrew paths.
-#[allow(unused)]
-pub fn resolve_ytdlp(element_id: String, url: String,
-                     cookie: String, user_agent: String, referer: String) {
-    log_msg(&format!("resolve_ytdlp: element_id={} url={}", element_id, url));
+/// Spawn yt-dlp in a background thread, then dispatch results to the main
+/// thread to update the target cache and repaint the matching panel.
+fn spawn_ytdlp_resolve(
+    element_id: String,
+    url: String,
+    cookie: String,
+    user_agent: String,
+    referer: String,
+) {
+    log_msg(&format!("spawn_ytdlp_resolve: element_id={} url={}", element_id, url));
 
     std::thread::spawn(move || {
         let formats = run_ytdlp_macos(&url, &cookie, &user_agent, &referer);
-        log_msg(&format!("resolve_ytdlp: found {} formats for {}", formats.len(), element_id));
+        let found = formats.len();
+        log_msg(&format!("spawn_ytdlp_resolve: found {} formats for {}", found, element_id));
 
-        // Dispatch back to main thread with results
         let eid = element_id.clone();
         Queue::main().exec_async(move || {
+            // Update cache with resolved formats
+            {
+                let mut cache = target_cache().lock().unwrap();
+                if let Some(entry) = cache.get_mut(&eid) {
+                    entry.status = TargetStatus::Ready;
+                    entry.formats = formats;
+                }
+            }
             // Force repaint of the matching view
             unsafe {
                 let lock = panels().lock().unwrap();
@@ -413,7 +602,6 @@ pub fn resolve_ytdlp(element_id: String, url: String,
 }
 
 fn find_ytdlp_path() -> Option<String> {
-    // Try PATH first
     let path_check = std::process::Command::new("which")
         .arg("yt-dlp")
         .output();
@@ -427,11 +615,9 @@ fn find_ytdlp_path() -> Option<String> {
             }
         }
     }
-    // Try Homebrew ARM (Apple Silicon)
     if std::path::Path::new("/opt/homebrew/bin/yt-dlp").exists() {
         return Some("/opt/homebrew/bin/yt-dlp".to_string());
     }
-    // Try Homebrew Intel / manual install
     if std::path::Path::new("/usr/local/bin/yt-dlp").exists() {
         return Some("/usr/local/bin/yt-dlp".to_string());
     }
@@ -524,7 +710,7 @@ fn run_ytdlp_macos(url: &str, cookie: &str, user_agent: &str, referer: &str) -> 
 // mouse events for drag, quality menu, and dismiss.
 //
 // Ivars (declared in register_button_overlay_view):
-//   _parentPanel  *mut NSObject  — owning NSPanel
+//   _parentPanel  *mut NSObject  — owning NSPanel (ASSIGN, not retained)
 
 unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel, _dirty_rect: NSRect) {
     let this: &NSObject = unsafe { &*(this as *mut NSObject) };
@@ -534,7 +720,7 @@ unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel,
         let cg: *mut c_void = msg_send![ctx, CGContext];
         if cg.is_null() { return; }
 
-        let bounds: NSRect = msg_send![this, bounds];
+        let _bounds: NSRect = msg_send![this, bounds];
         let is_dark = IS_DARK.load(Ordering::Relaxed);
 
         // ── Colors ────────────────────────────────────────────────────────
@@ -550,13 +736,13 @@ unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel,
         let accent_b: f64 = 1.0;
 
         // ── Draw container rounded rect ───────────────────────────────────
-        let container_w = LOGO_L + LOGO_SZ + PILL_GAP_L + 80.0 + PILL_GAP_M + X_W + R_PAD;
-        let container_x = bounds.size.width - container_w;
-        let container_y = bounds.size.height - HUD_H;
+        let container_w = container_width();
+        // Since the panel is exactly container_w × HUD_H, the container fills
+        // the entire bounds.
+        let container_x = 0.0;
+        let container_y = 0.0;
 
-        // Set fill color
         CGContextSetRGBFillColor(cg, bg_r, bg_g, bg_b, bg_a);
-        // Draw rounded rect
         let r = PILL_R;
         CGContextBeginPath(cg);
         CGContextMoveToPoint(cg, container_x + r, container_y);
@@ -585,7 +771,6 @@ unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel,
         CGContextAddArc(cg, logo_cx, logo_cy, logo_r, 0.0, 2.0 * std::f64::consts::PI, 0);
         CGContextFillPath(cg);
 
-        // Draw "T" in the logo circle
         CGContextSetRGBFillColor(cg, 1.0, 1.0, 1.0, 1.0);
         CGContextSelectFont(cg, b"Helvetica\0" as *const u8 as *const i8, 10.0, kCGEncodingMacRoman);
         CGContextShowTextAtPoint(cg, logo_cx - 3.0, logo_cy - 4.0, b"T\0" as *const u8 as *const i8, 1);
@@ -643,7 +828,7 @@ unsafe extern "C" fn button_overlay_view_draw_rect(this: *mut AnyObject, _: Sel,
         CGContextClosePath(cg);
         CGContextFillPath(cg);
 
-        // Draw "×" symbol (MacRoman encoding: byte 0xD7 = multiplication sign)
+        // Draw "×" symbol (MacRoman: 0xD7)
         CGContextSetRGBFillColor(cg, text_r, text_g, text_b, 0.8);
         CGContextSelectFont(cg, b"Helvetica\0" as *const u8 as *const i8, 12.0, kCGEncodingMacRoman);
         CGContextShowTextAtPoint(cg, x_pill_x + 7.0, text_pill_y + 3.0,
@@ -655,12 +840,11 @@ unsafe extern "C" fn button_overlay_view_mouse_down(this: *mut AnyObject, _: Sel
     let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
         let loc: NSPoint = msg_send![event, locationInWindow];
-        let bounds: NSRect = msg_send![this, bounds];
 
-        // Hit test zones (same layout as drawRect)
-        let container_w = LOGO_L + LOGO_SZ + PILL_GAP_L + 80.0 + PILL_GAP_M + X_W + R_PAD;
-        let container_x = bounds.size.width - container_w;
-        let container_y = bounds.size.height - HUD_H;
+        // Hit test zones (same layout as drawRect — panel is container_w × HUD_H)
+        let container_w = container_width();
+        let container_x = 0.0;
+        let container_y = 0.0;
         let text_pill_x = container_x + PILL_START_X;
         let text_pill_w = 80.0;
         let x_pill_x = text_pill_x + text_pill_w + PILL_GAP_M;
@@ -669,12 +853,14 @@ unsafe extern "C" fn button_overlay_view_mouse_down(this: *mut AnyObject, _: Sel
             && loc.y >= container_y && loc.y < container_y + HUD_H
         {
             if loc.x < PILL_START_X + container_x {
-                // Drag zone (logo area) — handled in mouseDragged:
+                // Drag zone (logo area) — pass through to NSView drag tracking
                 log_msg("mouseDown: drag zone");
             } else if loc.x >= text_pill_x && loc.x < text_pill_x + text_pill_w {
                 // TextPill — show quality menu
                 log_msg("mouseDown: text pill — showing menu");
                 show_quality_menu(this, event);
+                // Don't pass to super, menu handles it
+                return;
             } else if loc.x >= x_pill_x && loc.x < x_pill_x + X_W {
                 // X pill — dismiss
                 log_msg("mouseDown: X pill — dismiss");
@@ -682,10 +868,11 @@ unsafe extern "C" fn button_overlay_view_mouse_down(this: *mut AnyObject, _: Sel
                 if !panel.is_null() {
                     let _: () = msg_send![panel, orderOut: std::ptr::null_mut::<NSObject>()];
                 }
+                return;
             }
         }
 
-        // Pass to super for drag tracking
+        // Pass to super for drag tracking (NSView handles mouseDragged:)
         let superclass = class!(NSView);
         let _: () = msg_send![super(this, superclass), mouseDown: event];
     }
@@ -708,7 +895,71 @@ unsafe extern "C" fn button_overlay_view_mouse_dragged(this: *mut AnyObject, _: 
 unsafe extern "C" fn button_overlay_view_mouse_up(this: *mut AnyObject, _: Sel, event: *mut NSObject) {
     let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
-        log_msg("mouseUp: drag committed (if any)");
+        log_msg("mouseUp: drag committed");
+
+        let panel = get_parent_panel(this as *const NSObject as *mut NSObject);
+        if !panel.is_null() {
+            // Read current panel frame origin
+            let current_origin: NSPoint = msg_send![panel, frameOrigin];
+
+            // Look up the element we belong to
+            let eid = get_element_id_str(this as *const NSObject as *mut NSObject);
+            if let Some(eid) = eid {
+                // Find panel record to get current video element geometry
+                let geom = {
+                    let lock = panels().lock().unwrap();
+                    lock.iter().find(|p| p.element_id == eid).map(|p| {
+                        (p.screen_x, p.screen_y, p.width, p.height)
+                    })
+                };
+
+                if let Some((sx, sy, w, _h)) = geom {
+                    // Compute the anchor position (no-drag position in Cocoa)
+                    let screen_h = primary_screen_height();
+                    let cw = container_width();
+                    let css_hud_x = sx as f64 + w as f64 - cw;
+                    let cocoa_hud_bottom = screen_h - sy as f64 + HUD_GAP;
+
+                    let anchor_x = css_hud_x;
+                    let anchor_y = cocoa_hud_bottom;
+
+                    // Drag delta in Cocoa coordinates
+                    let cocoa_dx = current_origin.x - anchor_x;
+                    let cocoa_dy = current_origin.y - anchor_y;
+
+                    // Convert to CSS coordinates: X is same, Y is flipped
+                    let css_dx = cocoa_dx as i32;
+                    let css_dy = -(cocoa_dy as i32);
+
+                    log_msg(&format!("mouseUp: sending OVERLAY_DRAG_MOVED dx={} dy={}", css_dx, css_dy));
+
+                    // Read tab_id and media_url from cache
+                    let (tab_id, media_url) = {
+                        let cache = target_cache().lock().unwrap();
+                        cache.get(&eid).map(|e| (e.tab_id, e.media_url.clone()))
+                            .unwrap_or((0, String::new()))
+                    };
+
+                    // Send OVERLAY_DRAG_MOVED
+                    write_response(&serde_json::json!({
+                        "type": "OVERLAY_DRAG_MOVED",
+                        "tabId": tab_id,
+                        "elementId": eid,
+                        "mediaUrl": media_url,
+                        "dx": css_dx,
+                        "dy": css_dy,
+                    }));
+
+                    // Update cache with new drag offset
+                    let mut cache = target_cache().lock().unwrap();
+                    if let Some(entry) = cache.get_mut(&eid) {
+                        entry.drag_offset_x = css_dx;
+                        entry.drag_offset_y = css_dy;
+                    }
+                }
+            }
+        }
+
         let superclass = class!(NSView);
         let _: () = msg_send![super(this, superclass), mouseUp: event];
     }
@@ -716,32 +967,56 @@ unsafe extern "C" fn button_overlay_view_mouse_up(this: *mut AnyObject, _: Sel, 
 
 // ── Quality Menu ──────────────────────────────────────────────────────────────
 
-/// Show an NSMenu popup with quality options.
 unsafe fn show_quality_menu(view: &NSObject, event: *mut NSObject) {
+    // Look up cached target metadata for this view
+    let eid = get_element_id_str(view as *const NSObject as *mut NSObject);
+    let cache_data = eid.as_ref().and_then(|eid| {
+        let cache = target_cache().lock().unwrap();
+        cache.get(eid).map(|e| {
+            (e.formats.clone(), e.tab_id, e.media_url.clone(),
+             e.referer.clone(), e.user_agent.clone(), e.cookie.clone())
+        })
+    });        let (formats, _tab_id, _media_url, _referer, _user_agent, _cookie) = cache_data.unwrap_or_default();
+
     let quality_title = NSString::from_str("Quality");
     let menu: *mut NSObject = msg_send![class!(NSMenu), alloc];
     let menu: *mut NSObject = msg_send![menu, initWithTitle: &*quality_title];
 
-    // Add default items
-    let items = [
-        "Download (Best quality)",
-        "Download (720p)",
-        "Download (480p)",
-        "Download (Audio only)",
-    ];
-    for &title in &items {
-        let item: *mut NSObject = msg_send![class!(NSMenuItem), alloc];
-        let item_title = NSString::from_str(title);
-        let empty_key = NSString::from_str("");
-        let item: *mut NSObject = msg_send![item, initWithTitle: &*item_title
-                                                   action: sel!(menuItemSelected:)
-                                            keyEquivalent: &*empty_key];
-        let _: () = msg_send![menu, addItem: item];
-        let _: () = msg_send![item, setTarget: view as *const NSObject as *mut NSObject];
-        let _: () = msg_send![item, release];
+    // Build menu from resolved formats (or fallback default items)
+    if formats.is_empty() {
+        // No resolved formats — show static defaults (user can still click,
+        // but the download will use the raw media URL)
+        let items = [
+            "Download (Default Quality)",
+            "Download (720p)",
+            "Download (480p)",
+            "Download (Audio only)",
+        ];
+        for &title in &items {
+            add_menu_item(menu, view, title);
+        }
+    } else {
+        for (idx, f) in formats.iter().enumerate() {
+            let label = format!("{}. {}", idx + 1, f.label);
+            add_menu_item(menu, view, &label);
+        }
     }
 
-    // Get click location in screen coordinates
+    // Separator + Copy Media URL
+    let empty_str = NSString::from_str("");
+    let sep: *mut NSObject = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: sep];
+
+    let copy_item: *mut NSObject = msg_send![class!(NSMenuItem), alloc];
+    let copy_title = NSString::from_str("Copy Media URL");
+    let copy_item: *mut NSObject = msg_send![copy_item, initWithTitle: &*copy_title
+                                                       action: sel!(copyUrlSelected:)
+                                                keyEquivalent: &*empty_str];
+    let _: () = msg_send![menu, addItem: copy_item];
+    let _: () = msg_send![copy_item, setTarget: view as *const NSObject as *mut NSObject];
+    let _: () = msg_send![copy_item, release];
+
+    // Show at click location in screen coordinates
     let win: *mut NSObject = msg_send![event, window];
     let loc_in_win: NSPoint = msg_send![event, locationInWindow];
     let loc_on_screen: NSPoint = msg_send![win, convertPointToScreen: loc_in_win];
@@ -752,14 +1027,90 @@ unsafe fn show_quality_menu(view: &NSObject, event: *mut NSObject) {
     let _: () = msg_send![menu, release];
 }
 
-unsafe extern "C" fn button_overlay_view_menu_item_selected(_this: *mut AnyObject, _: Sel, sender: *mut NSObject) {
+unsafe fn add_menu_item(menu: *mut NSObject, view: &NSObject, title: &str) {
+    let item: *mut NSObject = msg_send![class!(NSMenuItem), alloc];
+    let item_title = NSString::from_str(title);
+    let empty_key = NSString::from_str("");
+    let item: *mut NSObject = msg_send![item, initWithTitle: &*item_title
+                                               action: sel!(menuItemSelected:)
+                                        keyEquivalent: &*empty_key];
+    let _: () = msg_send![menu, addItem: item];
+    let _: () = msg_send![item, setTarget: view as *const NSObject as *mut NSObject];
+    let _: () = msg_send![item, release];
+}
+
+unsafe extern "C" fn button_overlay_view_menu_item_selected(this: *mut AnyObject, _: Sel, sender: *mut NSObject) {
+    let this: &NSObject = unsafe { &*(this as *mut NSObject) };
     unsafe {
         let title: *mut NSObject = msg_send![sender, title];
         let title_str: *mut NSString = msg_send![title, description];
         let utf8: *mut i8 = msg_send![title_str, UTF8String];
-        if !utf8.is_null() {
-            let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
-            log_msg(&format!("menu item selected: {}", s));
+        if utf8.is_null() { return; }
+        let title = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        log_msg(&format!("menu item selected: {}", title));
+
+        // Look up cached metadata for this view's element
+        let eid = get_element_id_str(this as *const NSObject as *mut NSObject);
+        let meta = eid.as_ref().and_then(|eid| {
+            let cache = target_cache().lock().unwrap();
+            cache.get(eid).map(|e| {
+                (e.formats.clone(), e.tab_id, e.media_url.clone(),
+                 e.referer.clone(), e.user_agent.clone(), e.cookie.clone())
+            })
+        });
+
+        if let Some((formats, tab_id, media_url, referer, user_agent, cookie)) = meta {
+            // Determine which format index was selected (format items are numbered "1. ...")
+            let selected_idx = if title.contains(". ") {
+                title.split('.').next()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .map(|i| i.wrapping_sub(1))
+            } else {
+                None
+            };
+
+            let (video_url, audio_url) = match selected_idx {
+                Some(idx) if idx < formats.len() => {
+                    (formats[idx].video_url.clone(), formats[idx].audio_url.clone())
+                }
+                _ => (media_url.clone(), String::new()),
+            };
+
+            log_msg(&format!("menu item: sending OVERLAY_DOWNLOAD_TRIGGER tab={} video={}", tab_id, video_url));
+
+            write_response(&serde_json::json!({
+                "type": "OVERLAY_DOWNLOAD_TRIGGER",
+                "tabId": tab_id,
+                "elementId": eid.unwrap_or_default(),
+                "videoUrl": video_url,
+                "audioUrl": audio_url,
+                "headers": {
+                    "User-Agent": user_agent,
+                    "Cookie": cookie,
+                    "Referer": referer,
+                }
+            }));
+        }
+    }
+}
+
+unsafe extern "C" fn button_overlay_view_copy_url(this: *mut AnyObject, _: Sel, _sender: *mut NSObject) {
+    unsafe {
+        let eid = get_element_id_str(this as *const NSObject as *mut NSObject);
+        let media_url = eid.as_ref().and_then(|eid| {
+            let cache = target_cache().lock().unwrap();
+            cache.get(eid).map(|e| e.media_url.clone())
+        }).unwrap_or_default();
+
+        if !media_url.is_empty() {
+            // Copy to clipboard via NSPasteboard
+            let pb: *mut NSObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            let _: () = msg_send![pb, clearContents];
+            let nsstr = NSString::from_str(&media_url);
+            let arr: *mut NSObject = msg_send![class!(NSArray), arrayWithObject: &*nsstr];
+            let _: BOOL = msg_send![pb, writeObjects: arr];
+
+            log_msg(&format!("copyUrl: {}", media_url));
         }
     }
 }
@@ -783,6 +1134,7 @@ extern "C" {
     fn CGContextShowTextAtPoint(c: CGContextRef, x: f64, y: f64, text: *const i8, len: usize);
 }
 
+#[allow(non_upper_case_globals)]
 const kCGEncodingMacRoman: i32 = 0;
 #[cfg(target_arch = "aarch64")]
 const YES: BOOL = true;
@@ -794,8 +1146,10 @@ const YES: BOOL = 1i8 as BOOL;
 const NO:  BOOL = 0i8 as BOOL;
 
 // ── Associated Object helpers ────────────────────────────────────────────────
-// We use the Objective-C runtime's associated object API to attach the parent
-// NSPanel pointer to each ButtonOverlayView instance.
+// Uses RETAIN policy so the parent panel pointer is always valid.
+// The retain cycle (panel→view via contentView, view→panel via associated
+// object) is broken explicitly in destroy() by nil-ing the association
+// before releasing the panel.
 
 const OBJC_ASSOCIATION_RETAIN: usize = 0x301;
 
@@ -812,9 +1166,13 @@ extern "C" {
     ) -> *mut NSObject;
 }
 
-/// Returns a stable pointer to use as an associated object key.
 fn parent_panel_key() -> *const c_void {
     static KEY: u8 = 0;
+    &KEY as *const u8 as *const c_void
+}
+
+fn element_id_key() -> *const c_void {
+    static KEY: u8 = 1;
     &KEY as *const u8 as *const c_void
 }
 
@@ -826,6 +1184,22 @@ unsafe fn get_parent_panel(view: *mut NSObject) -> *mut NSObject {
     objc_getAssociatedObject(view, parent_panel_key())
 }
 
+unsafe fn set_element_id_str(view: *mut NSObject, eid: &str) {
+    let nsstr = NSString::from_str(eid);
+    // NSString is retained by the associated object (RETAIN policy on the string itself)
+    objc_setAssociatedObject(view, element_id_key(), &*nsstr as *const NSString as *mut NSObject, 0x301);
+}
+
+unsafe fn get_element_id_str(view: *mut NSObject) -> Option<String> {
+    let obj = objc_getAssociatedObject(view, element_id_key());
+    if obj.is_null() { return None; }
+    let nsstr: *mut NSString = obj as *mut NSString;
+    let utf8: *mut i8 = msg_send![nsstr, UTF8String];
+    if utf8.is_null() { return None; }
+    let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+    Some(s)
+}
+
 // ── Class registration: ButtonOverlayView ─────────────────────────────────────
 
 fn register_button_overlay_view() {
@@ -834,10 +1208,8 @@ fn register_button_overlay_view() {
         .expect("Failed to allocate ButtonOverlayView class");
 
     unsafe {
-        // Add ivars
         builder.add_ivar::<*mut NSObject>("_parentPanel");
 
-        // Add methods
         builder.add_method(sel!(drawRect:),
             button_overlay_view_draw_rect as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect));
         builder.add_method(sel!(mouseDown:),
@@ -848,13 +1220,13 @@ fn register_button_overlay_view() {
             button_overlay_view_mouse_up as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
         builder.add_method(sel!(menuItemSelected:),
             button_overlay_view_menu_item_selected as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
+        builder.add_method(sel!(copyUrlSelected:),
+            button_overlay_view_copy_url as unsafe extern "C" fn(*mut AnyObject, Sel, *mut NSObject));
 
         builder.register();
     }
     log_msg("ButtonOverlayView class registered");
 }
-
-// ── Initialise custom class on first use ─────────────────────────────────────
 
 fn ensure_view_class() {
     static INIT: std::sync::Once = std::sync::Once::new();

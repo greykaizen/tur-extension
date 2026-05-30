@@ -354,6 +354,7 @@ unsafe extern "system" fn controller_wndproc(
     }
 }
 
+#[allow(dead_code)]
 fn log_debug(msg: &str) {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -555,6 +556,7 @@ fn detect_dark_mode() -> bool {
 
 
 
+#[allow(dead_code)]
 fn canonical_media_token(url: &str) -> String {
     if url.is_empty() {
         return String::new();
