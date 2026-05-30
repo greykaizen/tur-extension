@@ -4,10 +4,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 fn log_debug(msg: &str) {
     use std::fs::OpenOptions;
     use std::io::Write;
+    let path = std::env::temp_dir().join("tur-overlay-debug.log");
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
+        .open(&path)
     {
         let _ = writeln!(file, "{}", msg);
     }

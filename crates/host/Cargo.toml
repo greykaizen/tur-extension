@@ -10,40 +10,52 @@ serde_json = "1"
 # Windows-only Win32 bindings
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
-    # Foundation + UI
-    "Foundation_Numerics",              # required for CreateSolidColorBrush + D2D1 math types
+    "Foundation_Numerics",
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
-    # COM (CoInitializeEx, CoCreateInstance)
     "Win32_System_Com",
-    # GDI (still used for HitTest cursor and PAINTSTRUCT)
     "Win32_Graphics_Gdi",
-    # Direct3D 11 — BGRA device for D2D interop
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
-    # DXGI — flip-model swapchain + PREMULTIPLIED alpha
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    # Direct2D — hardware-accelerated 2D rendering
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
-    # DirectWrite — GPU text layout and rendering
     "Win32_Graphics_DirectWrite",
-    # DirectComposition — WS_EX_NOREDIRECTIONBITMAP visual tree
     "Win32_Graphics_DirectComposition",
-    # Input — SetCapture/ReleaseCapture for drag handling
     "Win32_UI_Input_KeyboardAndMouse",
-    # WIC — PNG logo decode (IWICImagingFactory)
     "Win32_Graphics_Imaging",
-    # Clipboard & Memory management
     "Win32_System_DataExchange",
     "Win32_System_Memory",
 ] }
 
-# macOS-only AppKit bindings (NSPanel overlay skeleton)
+# macOS-only AppKit bindings + GCD
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch         = "0.2"
 objc2            = "0.5"
-objc2-app-kit    = { version = "0.2", features = ["NSPanel", "NSScreen", "NSWindow", "NSView", "NSColor", "NSApplication"] }
-objc2-foundation = "0.2"
+objc2-app-kit    = { version = "0.2", features = [
+    "NSApplication",
+    "NSBezierPath",
+    "NSColor",
+    "NSEvent",
+    "NSFont",
+    "NSGraphicsContext",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPanel",
+    "NSPasteboard",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.2", features = [
+    "NSArray",
+    "NSAttributedString",
+    "NSDictionary",
+    "NSString",
+    "NSThread",
+    "NSUserDefaults",
+] }

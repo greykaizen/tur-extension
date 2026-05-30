@@ -3,6 +3,8 @@
 use std::sync::mpsc;
 
 mod types;
+mod ytdlp_parse;
+
 use types::{TargetPayload, TargetsUpdate};
 
 #[cfg(target_os = "windows")]
@@ -67,11 +69,8 @@ fn main() {
     }
     #[cfg(target_os = "macos")]
     {
-        while let Ok(update) = rx.recv() {
-            unsafe {
-                handle_targets_update_macos(&update);
-            }
-        }
+        macos::run(rx);
+        macos::destroy();
     }
 }
 
@@ -125,10 +124,11 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
             }
             "QUEUE_DOWNLOAD" => {
                 eprintln!("[tur] RECEIVED QUEUE_DOWNLOAD message");
+                let log_path = std::env::temp_dir().join("tur-overlay-debug.log");
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
+                    .open(&log_path)
                 {
                     use std::io::Write;
                     let _ = writeln!(file, "[main] QUEUE_DOWNLOAD received: {}", serde_json::to_string_pretty(&msg).unwrap_or_default());
@@ -354,6 +354,19 @@ unsafe extern "system" fn controller_wndproc(
     }
 }
 
+fn log_debug(msg: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let path = std::env::temp_dir().join("tur-overlay-debug.log");
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
+
 // ── overlay update logic ─────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -512,37 +525,7 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
     });
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn handle_targets_update_macos(update: &TargetsUpdate) {
-    let overlay_targets: Vec<macos::MacosTargetInfo> = update
-        .targets
-        .iter()
-        .map(|t| macos::MacosTargetInfo {
-            element_id: t.element_id.clone(),
-            screen_x:   t.screen_x,
-            screen_y:   t.screen_y,
-            width:      t.width,
-            _height:    t.height,
-            media_url:  t.media_url.clone(),
-            drag_offset_x: t.drag_offset_x,
-            drag_offset_y: t.drag_offset_y,
-        })
-        .collect();
 
-    macos::update(types::CanvasUpdate {
-        tab_id: update.tab_id,
-        viewport_screen_x: update.viewport_screen_x,
-        viewport_screen_y: update.viewport_screen_y,
-        viewport_width: update.viewport_width,
-        viewport_height: update.viewport_height,
-        device_pixel_ratio: update.device_pixel_ratio,
-        targets: overlay_targets,
-        owner: 0,
-        is_dark: false,
-        referer: update.referer.clone(),
-        user_agent: update.user_agent.clone(),
-    });
-}
 
 // ── dark mode detection (cached once) ────────────────────────────────────
 
@@ -570,17 +553,7 @@ fn detect_dark_mode() -> bool {
     })
 }
 
-fn log_debug(msg: &str) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(r"C:\Users\Shah\.gemini\antigravity-ide\brain\f3fdf00f-ff53-4d50-8779-b8b9f6116f8b\scratch\overlay_debug.log")
-    {
-        let _ = writeln!(file, "{}", msg);
-    }
-}
+
 
 fn canonical_media_token(url: &str) -> String {
     if url.is_empty() {

@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
