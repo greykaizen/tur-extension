@@ -14,7 +14,7 @@
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "scripts/background.js"
+    "scripts": ["scripts/background.js"]
   },
   "action": {
     "default_title": "Download with Tur",
