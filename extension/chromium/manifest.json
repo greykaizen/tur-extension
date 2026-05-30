@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3GabSa7WBTCvZU6EbrWbw5G0mALiEoJz29Yj7Dsb0Imu9aPfbcbWvXi+GhVmDLx2gVR6ACZB2PErodcJK1EOffguUGdwHISa9+WrSbirgQ9csYw22c4BHHaF8AXbKCDcVusJFBZljPTUl3acsjSIPIeK1lFt2gMLO41XuLZc9szV5aokjgDnqOAqj0iqiL6Rtk4O8aiPbdOeWNcNxkUf/fDXjlsCqX32o8iC/pjfyq8ruYbJz7U9TSYzrjJx9j0tiKM2KeVYCbZgcHKJaTNEn7weTDZN+0qWJAfQIE4OKqldMecPtaDP3T0UecJbfP4Szt1LeTk1rDjtplvIC0MaJQIDAQAB",
   "name": "TUR Download Manager Interceptor",
   "version": "0.1.0",
   "description": "Seamlessly intercepts media streams and downloads, sending them directly to TUR Download Manager.",
@@ -44,12 +45,6 @@
     "32": "icons/32x32.png",
     "64": "icons/64x64.png",
     "128": "icons/128x128.png"
-  },
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "tur@project.local",
-      "strict_min_version": "109.0"
-    }
   }
 }
 

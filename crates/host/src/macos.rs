@@ -19,10 +19,10 @@
 
 #![cfg(target_os = "macos")]
 
-use crate::overlay::{CanvasUpdate, TargetInfo};
+use crate::types::{CanvasUpdate, TargetInfo};
 
 // Re-export TargetInfo so callers don't need to qualify the path.
-pub use crate::overlay::TargetInfo as MacosTargetInfo;
+pub use crate::types::TargetInfo as MacosTargetInfo;
 
 // ── public API ───────────────────────────────────────────────────────────────
 

@@ -156,11 +156,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   hideOverlayForTab(tabId);
 });
 
+let focusTimeout = null;
+
 chrome.windows.onFocusChanged.addListener((windowId) => {
-  focusedBrowserWindowId = windowId;
-  refreshOverlayVisibility().catch((error) => {
-    console.warn("[Background] Failed to refresh overlay on window focus change.", error);
-  });
+  if (focusTimeout) {
+    clearTimeout(focusTimeout);
+    focusTimeout = null;
+  }
+
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    // Delay handling focus loss to WINDOW_ID_NONE in case it's a temporary
+    // shift to a native popup/context menu (prevents overlay from disappearing).
+    focusTimeout = setTimeout(() => {
+      focusedBrowserWindowId = windowId;
+      refreshOverlayVisibility().catch((error) => {
+        console.warn("[Background] Failed to refresh overlay on window focus change.", error);
+      });
+      focusTimeout = null;
+    }, 300);
+  } else {
+    focusedBrowserWindowId = windowId;
+    refreshOverlayVisibility().catch((error) => {
+      console.warn("[Background] Failed to refresh overlay on window focus change.", error);
+    });
+  }
 });
 
 // ── Native Messaging reconnect manager ───────────────────────────────────────

@@ -1,43 +1,29 @@
-use std::ffi::c_void;
-use std::ptr::null_mut;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::mpsc;
+
+mod types;
+use types::{TargetPayload, TargetsUpdate};
+
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
+#[cfg(target_os = "windows")]
+use std::ptr::null_mut;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::*;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+#[cfg(target_os = "windows")]
 mod overlay;
+#[cfg(target_os = "windows")]
 mod window;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// Parsed geometry update from the extension (MEDIA_TARGETS_UPDATE).
-#[derive(Debug, Clone)]
-struct TargetsUpdate {
-    tab_id: i32,
-    _page_url: String,
-    viewport_screen_x: i32,
-    viewport_screen_y: i32,
-    viewport_width: i32,
-    viewport_height: i32,
-    _device_pixel_ratio: f64,
-    targets: Vec<TargetPayload>,
-}
-
-#[derive(Debug, Clone)]
-struct TargetPayload {
-    element_id: String,
-    _client_x: i32,
-    _client_y: i32,
-    width: i32,
-    height: i32,
-    screen_x: i32,
-    screen_y: i32,
-    media_url: String,
-    drag_offset_x: i32,
-    drag_offset_y: i32,
-}
-
 fn main() {
     // Per-monitor DPI awareness so coordinates are accurate.
+    #[cfg(target_os = "windows")]
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -48,6 +34,7 @@ fn main() {
     // COM object creation (D2D factory, WIC imaging factory, DComp device).
     // Calling CoInitializeEx inside a helper function is an anti-pattern that
     // causes silent RPC_E_CHANGED_MODE failures if the apartment type differs.
+    #[cfg(target_os = "windows")]
     unsafe {
         windows::Win32::System::Com::CoInitializeEx(
             None,
@@ -58,7 +45,7 @@ fn main() {
     }
 
     // Initialise the canvas overlay system.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     overlay::init();
     #[cfg(target_os = "macos")]
     macos::init();
@@ -74,8 +61,17 @@ fn main() {
     });
 
     // Create hidden controller window and enter message loop.
+    #[cfg(target_os = "windows")]
     unsafe {
         run_message_pump(rx);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        while let Ok(update) = rx.recv() {
+            unsafe {
+                handle_targets_update_macos(&update);
+            }
+        }
     }
 }
 
@@ -135,15 +131,18 @@ fn stdin_reader(tx: mpsc::Sender<TargetsUpdate>) {
     }
 
     // Signal main thread to quit.
-    let hwnd = CONTROLLER_HWND.load(std::sync::atomic::Ordering::Acquire);
-    if hwnd != 0 {
-        unsafe {
-            let _ = PostMessageW(
-                HWND(hwnd as *mut c_void),
-                WM_QUIT,
-                WPARAM(0),
-                LPARAM(0),
-            );
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = CONTROLLER_HWND.load(std::sync::atomic::Ordering::Acquire);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(hwnd as *mut c_void),
+                    WM_QUIT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
         }
     }
 }
@@ -199,10 +198,12 @@ fn write_response(value: &serde_json::Value) {
     let _ = out.flush();
 }
 
+#[cfg(target_os = "windows")]
 static CONTROLLER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 // ── main thread: controller window + message pump ────────────────────────
 
+#[cfg(target_os = "windows")]
 unsafe fn run_message_pump(rx: mpsc::Receiver<TargetsUpdate>) {
     let instance = HINSTANCE(
         windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -264,18 +265,18 @@ unsafe fn run_message_pump(rx: mpsc::Receiver<TargetsUpdate>) {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
     overlay::destroy();
     let _ = DestroyWindow(controller);
     let _ = Box::from_raw(rx_ptr);
 }
 
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn controller_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-) -> LRESULT {
+ ) -> LRESULT {
     match msg {
         WM_NCCREATE => LRESULT(1),
         WM_DESTROY => {
@@ -288,6 +289,7 @@ unsafe extern "system" fn controller_wndproc(
 
 // ── overlay update logic ─────────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
 unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
     let is_dark = detect_dark_mode();
 
@@ -295,10 +297,7 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         || update.viewport_width <= 0
         || update.viewport_height <= 0
     {
-        #[cfg(not(target_os = "macos"))]
         overlay::hide();
-        #[cfg(target_os = "macos")]
-        macos::hide();
         return;
     }
 
@@ -338,7 +337,6 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         })
         .collect();
 
-    #[cfg(not(target_os = "macos"))]
     overlay::update(overlay::CanvasUpdate {
         tab_id: update.tab_id,
         viewport_screen_x: update.viewport_screen_x,
@@ -346,12 +344,30 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         viewport_width: update.viewport_width,
         viewport_height: update.viewport_height,
         device_pixel_ratio: update._device_pixel_ratio,
-        targets: overlay_targets.clone(),
+        targets: overlay_targets,
         owner: owner.0 as isize,
         is_dark,
     });
-    #[cfg(target_os = "macos")]
-    macos::update(overlay::CanvasUpdate {
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn handle_targets_update_macos(update: &TargetsUpdate) {
+    let overlay_targets: Vec<macos::MacosTargetInfo> = update
+        .targets
+        .iter()
+        .map(|t| macos::MacosTargetInfo {
+            element_id: t.element_id.clone(),
+            screen_x:   t.screen_x,
+            screen_y:   t.screen_y,
+            width:      t.width,
+            _height:    t.height,
+            media_url:  t.media_url.clone(),
+            drag_offset_x: t.drag_offset_x,
+            drag_offset_y: t.drag_offset_y,
+        })
+        .collect();
+
+    macos::update(types::CanvasUpdate {
         tab_id: update.tab_id,
         viewport_screen_x: update.viewport_screen_x,
         viewport_screen_y: update.viewport_screen_y,
@@ -360,14 +376,16 @@ unsafe fn handle_targets_update(update: &TargetsUpdate, _controller: HWND) {
         device_pixel_ratio: update._device_pixel_ratio,
         targets: overlay_targets,
         owner: 0,
-        is_dark,
+        is_dark: false,
     });
 }
 
 // ── dark mode detection (cached once) ────────────────────────────────────
 
+#[cfg(target_os = "windows")]
 static DARK_MODE_INIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+#[cfg(target_os = "windows")]
 fn detect_dark_mode() -> bool {
     *DARK_MODE_INIT.get_or_init(|| {
         let output = std::process::Command::new("reg")
