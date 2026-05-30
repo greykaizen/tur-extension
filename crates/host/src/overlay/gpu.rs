@@ -350,6 +350,11 @@ pub unsafe fn resize_swapchain(
     h: u32,
     dpi: f32,
 ) -> windows::core::Result<()> {
+    // Update the Direct2D device context DPI so text metrics, layout, and
+    // vector assets render at the correct scale for the target monitor.
+    // This is critical when the browser moves between monitors with different
+    // DPIs at the same physical resolution.
+    gpu.d2d_ctx.SetDpi(dpi, dpi);
     gpu.d2d_ctx.SetTarget(None); // release D2D ref to the back-buffer bitmap
     gpu.target_bmp = None; // Drop old target bitmap before ResizeBuffers
     gpu.swapchain
