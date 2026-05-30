@@ -784,7 +784,13 @@ extern "C" {
 }
 
 const kCGEncodingMacRoman: i32 = 0;
+#[cfg(target_arch = "aarch64")]
+const YES: BOOL = true;
+#[cfg(target_arch = "aarch64")]
+const NO:  BOOL = false;
+#[cfg(not(target_arch = "aarch64"))]
 const YES: BOOL = 1i8 as BOOL;
+#[cfg(not(target_arch = "aarch64"))]
 const NO:  BOOL = 0i8 as BOOL;
 
 // ── Associated Object helpers ────────────────────────────────────────────────

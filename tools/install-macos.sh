@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-MANIFEST_NAME="com.tur.overlay.json"
+MANIFEST_NAME="com.tur.native_host.json"
 
 # ── Browser manifest destinations ────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ generate_chrome_manifest() {
     local binary_path="$1"
     cat <<EOF
 {
-  "name": "com.tur.overlay",
+  "name": "com.tur.native_host",
   "description": "tur — overlay AI download assistant",
   "path": "$binary_path",
   "type": "stdio",
@@ -105,11 +105,11 @@ generate_firefox_manifest() {
     local binary_path="$1"
     cat <<EOF
 {
-  "name": "com.tur.overlay",
+  "name": "com.tur.native_host",
   "description": "tur — overlay AI download assistant",
   "path": "$binary_path",
   "type": "stdio",
-  "allowed_extensions": ["tur@tur-overlay"]
+  "allowed_extensions": ["tur@project.local"]
 }
 EOF
 }
